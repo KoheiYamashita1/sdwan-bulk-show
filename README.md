@@ -25,4 +25,5 @@ show ip route
 show sdwan control connections
 
 Command exapmle
+
 #python3 multi-hosts-commands.py hosts.txt commands.txt
