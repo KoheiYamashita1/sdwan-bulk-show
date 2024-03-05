@@ -26,4 +26,4 @@ show sdwan control connections
 
 Command exapmle
 
-#python3 multi-hosts-commands.py hosts.txt commands.txt
+#python3 bulk-show.py hosts.txt commands.txt
