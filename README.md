@@ -1,5 +1,5 @@
 # sdwan-bulk-show
-This sample script gets multiple show command result for multiple sdwan devices.
+This sample script gets multiple show commands result for multiple sdwan devices.
 
 # how to use
 Put hosts and command file in same directory.
