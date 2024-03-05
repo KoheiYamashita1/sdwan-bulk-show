@@ -7,6 +7,7 @@ Put hosts and command file in same directory.
 Host file contains ipaddress(system-ip), username , passwod.
 
 $ more hosts.txt
+
 2.1.1.1,admin,admin
 
 3.1.1.1,admin,admin
