@@ -12,7 +12,7 @@ def is_valid_ip(ip_address):
     except ipaddress.AddressValueError:
         return False
 
-def connect_and_execute(router_ip, username, password, commands_file, output_filename, allow_unknown_hosts=False):
+def connect_and_execute(router_ip, username, password, commands_file, output_filename, allow_unknown_hosts=True):
     # Create an SSH client
     ssh = paramiko.SSHClient()
     ssh.load_system_host_keys()
@@ -91,9 +91,9 @@ if __name__ == "__main__":
     parser.add_argument("hosts_file", help="The file containing the list of hosts (IP, username, password)")
     parser.add_argument("commands_file", help="The file containing the list of commands")
     parser.add_argument(
-        "--accept-unknown-hosts",
+        "--reject-unknown-hosts",
         action="store_true",
-        help="Allow hosts not present in known_hosts (auto-add).",
+        help="Reject hosts not present in known_hosts.",
     )
     args = parser.parse_args()
 
@@ -126,7 +126,7 @@ if __name__ == "__main__":
                 password.strip(),
                 args.commands_file,
                 output_filename,
-                args.accept_unknown_hosts,
+                not args.reject_unknown_hosts,
             )
             futures.append(future)
 
