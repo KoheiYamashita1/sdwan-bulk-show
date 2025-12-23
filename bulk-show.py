@@ -12,11 +12,14 @@ def is_valid_ip(ip_address):
     except ipaddress.AddressValueError:
         return False
 
-def connect_and_execute(router_ip, username, password, commands_file, output_filename):
+def connect_and_execute(router_ip, username, password, commands_file, output_filename, allow_unknown_hosts=False):
     # Create an SSH client
     ssh = paramiko.SSHClient()
     ssh.load_system_host_keys()
-    ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+    if allow_unknown_hosts:
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    else:
+        ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
 
     def read_channel(channel, idle_timeout=1.0, max_wait=10.0):
         channel.settimeout(idle_timeout)
@@ -87,6 +90,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Connect to Cisco SD-WAN routers and execute commands.")
     parser.add_argument("hosts_file", help="The file containing the list of hosts (IP, username, password)")
     parser.add_argument("commands_file", help="The file containing the list of commands")
+    parser.add_argument(
+        "--accept-unknown-hosts",
+        action="store_true",
+        help="Allow hosts not present in known_hosts (auto-add).",
+    )
     args = parser.parse_args()
 
     # Read hosts file and execute commands for each valid router using parallel processing
@@ -111,7 +119,15 @@ if __name__ == "__main__":
                 continue
 
             output_filename = f"output_{router_ip.strip()}.txt"
-            future = executor.submit(connect_and_execute, router_ip.strip(), username.strip(), password.strip(), args.commands_file, output_filename)
+            future = executor.submit(
+                connect_and_execute,
+                router_ip.strip(),
+                username.strip(),
+                password.strip(),
+                args.commands_file,
+                output_filename,
+                args.accept_unknown_hosts,
+            )
             futures.append(future)
 
         # Wait for all futures to complete
