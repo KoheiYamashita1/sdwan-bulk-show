@@ -4,6 +4,13 @@ import time
 import ipaddress
 import concurrent.futures
 import socket
+import threading
+
+print_lock = threading.Lock()
+
+def log_message(message):
+    with print_lock:
+        print(message, flush=True)
 
 def is_valid_ip(ip_address):
     try:
@@ -44,12 +51,14 @@ def connect_and_execute(router_ip, username, password, commands_file, output_fil
     try:
         # Connect to the router using the NETCONF port (port 830)
         ssh.connect(router_ip, port=830, username=username, password=password, timeout=10)
+        log_message(f"[{router_ip}] connected")
 
         # Start an interactive shell
         shell = ssh.invoke_shell()
 
         # Send a command to invoke the shell (e.g., 'shell' command)
         shell.send("shell\n")
+        log_message(f"[{router_ip}] entered shell")
 
         # Wait for the command to execute and receive the output
         output = read_channel(shell, idle_timeout=1.0, max_wait=5.0)
@@ -72,13 +81,15 @@ def connect_and_execute(router_ip, username, password, commands_file, output_fil
                 command = line.strip()
                 if not command or command.startswith("#"):
                     continue
+                log_message(f"[{router_ip}] running: {command}")
                 shell.send(f"{command}\n")
                 command_output = read_channel(shell, idle_timeout=1.0, max_wait=10.0)
                 output_file.write(command_output)
+                log_message(f"[{router_ip}] done: {command}")
 
         # Close the SSH connection
     except (paramiko.AuthenticationException, paramiko.SSHException, socket.timeout, OSError) as ex:
-        print(f"Error while connecting to router {router_ip}: {ex}")
+        log_message(f"[{router_ip}] error: {ex}")
     finally:
         try:
             ssh.close()
