@@ -3,6 +3,7 @@ import argparse
 import time
 import ipaddress
 import concurrent.futures
+import socket
 
 def is_valid_ip(ip_address):
     try:
@@ -14,11 +15,32 @@ def is_valid_ip(ip_address):
 def connect_and_execute(router_ip, username, password, commands_file, output_filename):
     # Create an SSH client
     ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.load_system_host_keys()
+    ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+
+    def read_channel(channel, idle_timeout=1.0, max_wait=10.0):
+        channel.settimeout(idle_timeout)
+        chunks = []
+        start = time.monotonic()
+        last_data = start
+        while True:
+            now = time.monotonic()
+            if now - start >= max_wait:
+                break
+            try:
+                data = channel.recv(4096)
+                if not data:
+                    break
+                chunks.append(data.decode(errors="replace"))
+                last_data = now
+            except socket.timeout:
+                if now - last_data >= idle_timeout:
+                    break
+        return "".join(chunks)
 
     try:
         # Connect to the router using the NETCONF port (port 830)
-        ssh.connect(router_ip, port=830, username=username, password=password)
+        ssh.connect(router_ip, port=830, username=username, password=password, timeout=10)
 
         # Start an interactive shell
         shell = ssh.invoke_shell()
@@ -27,49 +49,38 @@ def connect_and_execute(router_ip, username, password, commands_file, output_fil
         shell.send("shell\n")
 
         # Wait for the command to execute and receive the output
-        time.sleep(1)  # Add a small delay to ensure the password prompt is received
-        output = ""
-        while shell.recv_ready():
-            output += shell.recv(1024).decode()
+        output = read_channel(shell, idle_timeout=1.0, max_wait=5.0)
 
         # Check if the password prompt is present
         if "password:" in output.lower():
             # Send the password again to authenticate
             shell.send(f"{password}\n")
+            output += read_channel(shell, idle_timeout=1.0, max_wait=5.0)
 
         # Set terminal length to 0 to disable pagination
         shell.send("terminal length 0\n")
 
         # Wait for the command to execute and receive the output
-        time.sleep(2)  # Add a small delay to ensure the command output is received
-        output = ""
-        while shell.recv_ready():
-            output += shell.recv(1024).decode()
+        output = read_channel(shell, idle_timeout=1.0, max_wait=5.0)
 
         # Read commands from the file and send them one by one
-        with open(commands_file, "r") as file:
+        with open(commands_file, "r") as file, open(output_filename, "a") as output_file:
             for line in file:
                 command = line.strip()
+                if not command or command.startswith("#"):
+                    continue
                 shell.send(f"{command}\n")
-                time.sleep(1)  # Add a small delay between commands
-
-                # Receive and store the command output in the output_file
-                command_output = ""
-                while shell.recv_ready():
-                    command_output += shell.recv(1024).decode()
-
-                with open(output_filename, "a") as output_file:
-                    output_file.write(command_output)
-
-                time.sleep(1)  # Add a small delay to allow the router to respond with the final output
+                command_output = read_channel(shell, idle_timeout=1.0, max_wait=10.0)
+                output_file.write(command_output)
 
         # Close the SSH connection
-        ssh.close()
-
-    except paramiko.AuthenticationException:
-        print(f"Authentication failed for router {router_ip}. Please check your credentials.")
-    except paramiko.SSHException as ssh_ex:
-        print(f"Error while connecting to router {router_ip}: {ssh_ex}")
+    except (paramiko.AuthenticationException, paramiko.SSHException, socket.timeout, OSError) as ex:
+        print(f"Error while connecting to router {router_ip}: {ex}")
+    finally:
+        try:
+            ssh.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     # Create argument parser
@@ -85,7 +96,14 @@ if __name__ == "__main__":
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
         for line in host_lines:
-            router_ip, username, password = line.strip().split(",")
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = [p.strip() for p in stripped.split(",")]
+            if len(parts) != 3:
+                print(f"Invalid host entry: {line.strip()}. Expected 'ip,username,password'. Skipping.")
+                continue
+            router_ip, username, password = parts
 
             # Check if the IP address is valid
             if not is_valid_ip(router_ip.strip()):
@@ -99,4 +117,3 @@ if __name__ == "__main__":
         # Wait for all futures to complete
         for future in concurrent.futures.as_completed(futures):
             future.result()
-
