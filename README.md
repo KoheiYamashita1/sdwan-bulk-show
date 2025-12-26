@@ -97,14 +97,14 @@ python3 run_on_vmanage.py <vmanage_ip> --user <user> [--password <pass> | --key 
 
 Example (password):
 ```bash
-python3 run_on_vmanage.py 10.71.131.72 --user sdwan --password sdwanadmin \
-  --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs --verbose
+python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> \
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs --verbose
 ```
 
 Example (SSH key):
 ```bash
-python3 run_on_vmanage.py 10.71.131.72 --user sdwan --key ~/.ssh/id_rsa \
-  --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs --verbose
+python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --key ~/.ssh/id_rsa \
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs --verbose
 ```
 
 Notes:
@@ -152,30 +152,30 @@ Output:
 ## vManage wrapper (run_on_vmanage.py)
 Password auth:
 ```bash
-python3 run_on_vmanage.py 10.71.131.72 --user sdwan --password sdwanadmin \
-  --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs
+python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> \
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
 ```
 
 Windows (PowerShell):
 ```powershell
-python run_on_vmanage.py 10.71.131.72 --user sdwan --password sdwanadmin `
-  --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs
+python run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> `
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
 ```
 
 Windows (PowerShell, single line):
 ```powershell
-python run_on_vmanage.py 10.71.131.72 --user sdwan --password sdwanadmin --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs
+python run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
 ```
 
 Windows (cmd):
 ```bat
-python run_on_vmanage.py 10.71.131.72 --user sdwan --password sdwanadmin --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs
+python run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
 ```
 
 SSH key auth:
 ```bash
-python3 run_on_vmanage.py 10.71.131.72 --user sdwan --key ~/.ssh/id_rsa \
-  --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs
+python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --key ~/.ssh/id_rsa \
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
 ```
 
 Download outputs are stored in:

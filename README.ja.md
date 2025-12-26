@@ -97,14 +97,14 @@ python3 run_on_vmanage.py <vmanage_ip> --user <user> [--password <pass> | --key 
 
 例 (パスワード):
 ```bash
-python3 run_on_vmanage.py 10.71.131.72 --user sdwan --password sdwanadmin \
-  --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs --verbose
+python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> \
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs --verbose
 ```
 
 例 (SSH鍵):
 ```bash
-python3 run_on_vmanage.py 10.71.131.72 --user sdwan --key ~/.ssh/id_rsa \
-  --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs --verbose
+python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --key ~/.ssh/id_rsa \
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs --verbose
 ```
 
 注:
@@ -152,30 +152,30 @@ python bulk-show.py host.txt command.txt
 ## vManageラッパー (run_on_vmanage.py)
 パスワード認証:
 ```bash
-python3 run_on_vmanage.py 10.71.131.72 --user sdwan --password sdwanadmin \
-  --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs
+python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> \
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
 ```
 
 Windows (PowerShell):
 ```powershell
-python run_on_vmanage.py 10.71.131.72 --user sdwan --password sdwanadmin `
-  --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs
+python run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> `
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
 ```
 
 Windows (PowerShell, 1行):
 ```powershell
-python run_on_vmanage.py 10.71.131.72 --user sdwan --password sdwanadmin --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs
+python run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
 ```
 
 Windows (cmd):
 ```bat
-python run_on_vmanage.py 10.71.131.72 --user sdwan --password sdwanadmin --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs
+python run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
 ```
 
 SSH鍵認証:
 ```bash
-python3 run_on_vmanage.py 10.71.131.72 --user sdwan --key ~/.ssh/id_rsa \
-  --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs
+python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --key ~/.ssh/id_rsa \
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
 ```
 
 ダウンロード先:
