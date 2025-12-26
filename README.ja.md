@@ -1,10 +1,56 @@
 # sdwan-bulk-show
-このサンプルは、複数のSD-WAN機器に対して複数のshowコマンドを実行して結果を取得します。
+このリポジトリは、vManage上で bulk-show.py を実行して複数のSD-WAN機器のログを収集するラッパーを提供します。
 
 English: README.md
 Japanese: README.ja.md
 
-# 使い方
+# run_on_vmanage.py (推奨)
+bulk-show.py と入力ファイルをvManageにアップロードしてリモート実行し、
+必要に応じて output_*.txt をPC側へダウンロードします。
+
+動作フロー:
+1) ローカルPCからvManageへSSH接続します。
+2) --remote-dir 配下にタイムスタンプ付きの作業ディレクトリを作成します。
+3) bulk-show.py、hostsファイル、commandsファイルをアップロードします。
+4) vshellに入り、vManage上で bulk-show.py を実行します。
+5) bulk-show.py が hosts に記載された各機器へ接続し、command の各コマンドを実行してログに書き込みます。
+6) output_*.txt を ./logs/<timestamp>/ にダウンロードします。
+
+フロー図:
+```
+ローカルPC -> SSH -> vManage -> vshell -> bulk-show.py -> SD-WAN機器
+                                         -> <remote-dir>/<timestamp>/logs
+                                         -> ダウンロード -> ./logs/<timestamp>/
+```
+
+ログ出力:
+- リモート側: <remote-dir>/<timestamp>/logs/output_<ip>_<YYYYmmdd_HHMMSS>.txt
+- ローカル側: ./logs/<YYYYmmdd_HHMMSS>/output_<ip>_<YYYYmmdd_HHMMSS>.txt
+
+使用方法:
+```bash
+python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> [--password <password> | --key <key_path>] \
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs [--verbose] [--quiet]
+```
+
+例 (パスワード):
+```bash
+python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> \
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs --verbose
+```
+
+例 (SSH鍵):
+```bash
+python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --key ~/.ssh/id_rsa \
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs --verbose
+```
+
+注:
+実行ごとに --remote-dir 配下にタイムスタンプのサブディレクトリを作成し、
+そこにアップロードと実行を行います。ログは <remote-dir>/<timestamp>/logs に作成されます。
+--verbose は詳細ログ、--quiet は最小限のログを表示します。
+
+# bulk-show.py (直接実行)
 hostsファイルとcommandファイルを同じディレクトリに置きます。
 
 hostsファイルには「IPアドレス(system-ip), ユーザ名, パスワード」を記載します。
@@ -63,56 +109,39 @@ python -m pip install -r requirements.txt
 4) venvを有効化したまま実行します。
 ```bash
 python bulk-show.py hosts.txt commands.txt
-python run_on_vmanage.py <vmanage_ip> --user <user> --password <pass> --remote-dir <remote_dir> --download-outputs
+python run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> --remote-dir /home/<username> --download-outputs
 ```
-
-# run_on_vmanage.py
-bulk-show.py と入力ファイルをvManageにアップロードしてリモート実行し、
-必要に応じて output_*.txt をPC側へダウンロードします。
-
-動作フロー:
-1) ローカルPCからvManageへSSH接続します。
-2) --remote-dir 配下にタイムスタンプ付きの作業ディレクトリを作成します。
-3) bulk-show.py、hostsファイル、commandsファイルをアップロードします。
-4) vshellに入り、vManage上で bulk-show.py を実行します。
-5) bulk-show.py が hosts に記載された各機器へ接続し、command の各コマンドを実行してログに書き込みます。
-6) output_*.txt を ./logs/<timestamp>/ にダウンロードします。
-
-フロー図:
-```
-ローカルPC -> SSH -> vManage -> vshell -> bulk-show.py -> SD-WAN機器
-                                         -> <remote-dir>/<timestamp>/logs
-                                         -> ダウンロード -> ./logs/<timestamp>/
-```
-
-ログ出力:
-- リモート側: <remote-dir>/<timestamp>/logs/output_<ip>_<YYYYmmdd_HHMMSS>.txt
-- ローカル側: ./logs/<YYYYmmdd_HHMMSS>/output_<ip>_<YYYYmmdd_HHMMSS>.txt
-
-使用方法:
-```bash
-python3 run_on_vmanage.py <vmanage_ip> --user <user> [--password <pass> | --key <key_path>] \
-  --remote-dir <remote_dir> --hosts <hosts_file> --commands <commands_file> [--download-outputs] [--verbose] [--quiet]
-```
-
-例 (パスワード):
-```bash
-python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> \
-  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs --verbose
-```
-
-例 (SSH鍵):
-```bash
-python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --key ~/.ssh/id_rsa \
-  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs --verbose
-```
-
-注:
-実行ごとに --remote-dir 配下にタイムスタンプのサブディレクトリを作成し、
-そこにアップロードと実行を行います。ログは <remote-dir>/<timestamp>/logs に作成されます。
---verbose は詳細ログ、--quiet は最小限のログを表示します。
 
 # フルコマンドサンプル
+## vManageラッパー (run_on_vmanage.py)
+パスワード認証:
+```bash
+python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> \
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
+```
+
+Windows (PowerShell):
+```powershell
+python run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> `
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
+```
+
+Windows (PowerShell, 1行):
+```powershell
+python run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
+```
+
+Windows (cmd):
+```bat
+python run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
+```
+
+SSH鍵認証:
+```bash
+python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --key ~/.ssh/id_rsa \
+  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
+```
+
 ## ローカル実行 (bulk-show.py)
 hosts/commandsの作成:
 ```bash
@@ -147,38 +176,4 @@ python bulk-show.py host.txt command.txt
 出力:
 ```
 ./logs/output_<ip>_<YYYYmmdd_HHMMSS>.txt
-```
-
-## vManageラッパー (run_on_vmanage.py)
-パスワード認証:
-```bash
-python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> \
-  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
-```
-
-Windows (PowerShell):
-```powershell
-python run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> `
-  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
-```
-
-Windows (PowerShell, 1行):
-```powershell
-python run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
-```
-
-Windows (cmd):
-```bat
-python run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --password <password> --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
-```
-
-SSH鍵認証:
-```bash
-python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --key ~/.ssh/id_rsa \
-  --remote-dir /home/<username> --hosts host.txt --commands command.txt --download-outputs
-```
-
-ダウンロード先:
-```
-./logs/<YYYYmmdd_HHMMSS>/output_<ip>_<YYYYmmdd_HHMMSS>.txt
 ```
