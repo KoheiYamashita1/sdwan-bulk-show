@@ -1,13 +1,13 @@
 # sdwan-bulk-show
-This sample script runs multiple show commands across multiple SD-WAN devices.
+このサンプルは、複数のSD-WAN機器に対して複数のshowコマンドを実行して結果を取得します。
 
 English: README.md
 Japanese: README.ja.md
 
-# Usage
-Put the hosts file and command file in the same directory.
+# 使い方
+hostsファイルとcommandファイルを同じディレクトリに置きます。
 
-The hosts file contains: IP address (system-ip), username, password.
+hostsファイルには「IPアドレス(system-ip), ユーザ名, パスワード」を記載します。
 
 ```bash
 $ more hosts.txt
@@ -16,9 +16,9 @@ $ more hosts.txt
 4.1.1.1,admin,admin
 ```
 
-The command file contains the show commands you want to run.
+commandファイルには実行したいshowコマンドを記載します。
 
-Example commands file:
+commandファイルの例:
 ```bash
 show version
 show ip int bri
@@ -26,22 +26,22 @@ show ip route
 show sdwan control connections
 ```
 
-Example:
+コマンド例:
 ```bash
 python3 bulk-show.py hosts.txt commands.txt
 ```
 
-# Output logs
-Logs are saved under ./logs with timestamps in the file name.
-You can override the log directory with --logs-dir.
+# 出力ログ
+ログは ./logs にタイムスタンプ付きで保存されます。
+--logs-dir で保存先を指定できます。
 
-# Setup on a clean PC (no Python/venv)
-1) Install Python 3 (3.10+ recommended).
-2) Create a virtual environment:
+# クリーンなPCでのセットアップ (Python/venvなし)
+1) Python 3 をインストールします (推奨: 3.10以降)。
+2) 仮想環境を作成します。
 ```bash
 python3 -m venv .venv
 ```
-3) Activate the venv and install dependencies:
+3) venvを有効化して依存関係を入れます。
 macOS/Linux:
 ```bash
 . .venv/bin/activate
@@ -60,61 +60,61 @@ Windows (cmd):
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
-4) Run the scripts from the activated venv:
+4) venvを有効化したまま実行します。
 ```bash
 python bulk-show.py hosts.txt commands.txt
 python run_on_vmanage.py <vmanage_ip> --user <user> --password <pass> --remote-dir <remote_dir> --download-outputs
 ```
 
 # run_on_vmanage.py
-This script uploads bulk-show.py + input files to vManage, executes the script remotely,
-and optionally downloads output_*.txt files back to your PC.
+bulk-show.py と入力ファイルをvManageにアップロードしてリモート実行し、
+必要に応じて output_*.txt をPC側へダウンロードします。
 
-Execution flow (overview):
-1) From your local PC, the wrapper connects to vManage over SSH.
-2) A timestamped working directory is created under --remote-dir.
-3) bulk-show.py, hosts file, and commands file are uploaded into that directory.
-4) The wrapper enters vshell and runs bulk-show.py on vManage.
-5) bulk-show.py logs into each SD-WAN device listed in hosts, runs each command, and writes output logs.
-6) The wrapper downloads the generated output_*.txt files to ./logs/<timestamp>/.
+動作フロー:
+1) ローカルPCからvManageへSSH接続します。
+2) --remote-dir 配下にタイムスタンプ付きの作業ディレクトリを作成します。
+3) bulk-show.py、hostsファイル、commandsファイルをアップロードします。
+4) vshellに入り、vManage上で bulk-show.py を実行します。
+5) bulk-show.py が hosts に記載された各機器へ接続し、command の各コマンドを実行してログに書き込みます。
+6) output_*.txt を ./logs/<timestamp>/ にダウンロードします。
 
-Flow diagram:
+フロー図:
 ```
-Local PC -> SSH -> vManage -> vshell -> bulk-show.py -> SD-WAN devices
-                                     -> <remote-dir>/<timestamp>/logs
-                                     -> download -> ./logs/<timestamp>/
+ローカルPC -> SSH -> vManage -> vshell -> bulk-show.py -> SD-WAN機器
+                                         -> <remote-dir>/<timestamp>/logs
+                                         -> ダウンロード -> ./logs/<timestamp>/
 ```
 
-Log output:
-- Remote logs are created at: <remote-dir>/<timestamp>/logs/output_<ip>_<YYYYmmdd_HHMMSS>.txt
-- Downloaded logs are stored at: ./logs/<YYYYmmdd_HHMMSS>/output_<ip>_<YYYYmmdd_HHMMSS>.txt
+ログ出力:
+- リモート側: <remote-dir>/<timestamp>/logs/output_<ip>_<YYYYmmdd_HHMMSS>.txt
+- ローカル側: ./logs/<YYYYmmdd_HHMMSS>/output_<ip>_<YYYYmmdd_HHMMSS>.txt
 
-Usage:
+使用方法:
 ```bash
 python3 run_on_vmanage.py <vmanage_ip> --user <user> [--password <pass> | --key <key_path>] \
   --remote-dir <remote_dir> --hosts <hosts_file> --commands <commands_file> [--download-outputs] [--verbose] [--quiet]
 ```
 
-Example (password):
+例 (パスワード):
 ```bash
 python3 run_on_vmanage.py 10.71.131.72 --user sdwan --password sdwanadmin \
   --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs --verbose
 ```
 
-Example (SSH key):
+例 (SSH鍵):
 ```bash
 python3 run_on_vmanage.py 10.71.131.72 --user sdwan --key ~/.ssh/id_rsa \
   --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs --verbose
 ```
 
-Notes:
-The script creates a timestamped subdirectory under --remote-dir for each run, uploads files there,
-and writes logs to <remote-dir>/<timestamp>/logs.
-Use --verbose for detailed remote output, or --quiet for minimal logs.
+注:
+実行ごとに --remote-dir 配下にタイムスタンプのサブディレクトリを作成し、
+そこにアップロードと実行を行います。ログは <remote-dir>/<timestamp>/logs に作成されます。
+--verbose は詳細ログ、--quiet は最小限のログを表示します。
 
-# Full command samples
-## Local bulk-show.py
-Prepare hosts/commands:
+# フルコマンドサンプル
+## ローカル実行 (bulk-show.py)
+hosts/commandsの作成:
 ```bash
 cat > host.txt <<'EOF'
 2.1.1.1,admin,admin
@@ -129,7 +129,7 @@ show ip int bri
 EOF
 ```
 
-Run:
+実行:
 ```bash
 python3 bulk-show.py host.txt command.txt
 ```
@@ -144,13 +144,13 @@ Windows (cmd):
 python bulk-show.py host.txt command.txt
 ```
 
-Output:
+出力:
 ```
 ./logs/output_<ip>_<YYYYmmdd_HHMMSS>.txt
 ```
 
-## vManage wrapper (run_on_vmanage.py)
-Password auth:
+## vManageラッパー (run_on_vmanage.py)
+パスワード認証:
 ```bash
 python3 run_on_vmanage.py 10.71.131.72 --user sdwan --password sdwanadmin \
   --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs
@@ -162,7 +162,7 @@ python run_on_vmanage.py 10.71.131.72 --user sdwan --password sdwanadmin `
   --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs
 ```
 
-Windows (PowerShell, single line):
+Windows (PowerShell, 1行):
 ```powershell
 python run_on_vmanage.py 10.71.131.72 --user sdwan --password sdwanadmin --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs
 ```
@@ -172,13 +172,13 @@ Windows (cmd):
 python run_on_vmanage.py 10.71.131.72 --user sdwan --password sdwanadmin --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs
 ```
 
-SSH key auth:
+SSH鍵認証:
 ```bash
 python3 run_on_vmanage.py 10.71.131.72 --user sdwan --key ~/.ssh/id_rsa \
   --remote-dir /home/sdwan --hosts host.txt --commands command.txt --download-outputs
 ```
 
-Download outputs are stored in:
+ダウンロード先:
 ```
 ./logs/<YYYYmmdd_HHMMSS>/output_<ip>_<YYYYmmdd_HHMMSS>.txt
 ```

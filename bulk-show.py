@@ -5,6 +5,8 @@ import ipaddress
 import concurrent.futures
 import socket
 import threading
+import os
+from datetime import datetime
 
 print_lock = threading.Lock()
 
@@ -98,7 +100,15 @@ def connect_and_execute(router_ip, username, password, commands_file, output_fil
 
 if __name__ == "__main__":
     # Create argument parser
-    parser = argparse.ArgumentParser(description="Connect to Cisco SD-WAN routers and execute commands.")
+    parser = argparse.ArgumentParser(
+        description="Connect to Cisco SD-WAN routers and execute commands.",
+        epilog=(
+            "Examples:\n"
+            "  python3 bulk-show.py hosts.txt commands.txt\n"
+            "  python3 bulk-show.py host.txt command.txt --logs-dir logs\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("hosts_file", help="The file containing the list of hosts (IP, username, password)")
     parser.add_argument("commands_file", help="The file containing the list of commands")
     parser.add_argument(
@@ -106,11 +116,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Reject hosts not present in known_hosts.",
     )
+    parser.add_argument(
+        "--logs-dir",
+        default="logs",
+        help="Directory to store output logs (default: logs)",
+    )
     args = parser.parse_args()
 
     # Read hosts file and execute commands for each valid router using parallel processing
     with open(args.hosts_file, "r") as hosts_file:
         host_lines = hosts_file.readlines()
+
+    logs_dir = args.logs_dir
+    os.makedirs(logs_dir, exist_ok=True)
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
@@ -129,7 +147,10 @@ if __name__ == "__main__":
                 print(f"Invalid IP address: {router_ip.strip()}. Skipping this host.")
                 continue
 
-            output_filename = f"output_{router_ip.strip()}.txt"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_filename = os.path.join(
+                logs_dir, f"output_{router_ip.strip()}_{timestamp}.txt"
+            )
             future = executor.submit(
                 connect_and_execute,
                 router_ip.strip(),
