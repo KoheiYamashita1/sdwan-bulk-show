@@ -134,7 +134,7 @@ python3 bulk-show.py host.txt command.txt --reject-unknown-hosts
 
 | オプション | 既定値 | 用途 |
 | --- | --- | --- |
-| `--port PORT` | `830` | 全ホストへ接続する SSH TCP ポート。 |
+| `--port PORT` | `830` | 全ホストへ接続する SSH TCP ポート。SD-WAN edges (cEdge / IOS-XE SD-WAN) は vManage `vshell` が使う対話 SSH サービスを **22 ではなく 830** で公開しています。non-SD-WAN 機器を叩くときだけ 22 等に上書きしてください。 |
 | `--reject-unknown-hosts` | 無効（自動受け入れ + WARN） | `~/.ssh/known_hosts` に未登録のホスト鍵を拒否します（MITM 対策）。 |
 | `--password-prompt` | 無効 | 起動時に共通パスワードを 1 回プロンプト入力し、ファイル内の埋め込みパスワードを上書きします。 |
 | `--logs-dir LOGS_DIR` | `logs` | 出力先ディレクトリを指定します。 |
@@ -143,13 +143,31 @@ python3 bulk-show.py host.txt command.txt --reject-unknown-hosts
 | `--retry-delay SECS` | `5.0` | リトライ間のスリープ秒数。 |
 | `--output-format LIST` | `text` | カンマ区切りで `text,json,csv` を組み合わせ可能。指定した形式ごとにホスト単位のファイルが追加生成されます。 |
 
+## SD-WAN 認証に関する注意
+
+`bulk-show.py` を vManage の `vshell` から起動する（推奨経路：`run_on_vmanage.py`）場合、
+各 SD-WAN edge への接続は **TCP/830** を使い、デバイス側でパスワードを **2 回**
+要求する仕様になっています:
+
+1. **SSH トランスポート層** — hosts ファイルまたは `--password-prompt` で渡したパスワードを、
+   SSH ハンドシェイクの一部として送信します。
+2. **デバイス内サブシェル** — 接続が確立したあと、スクリプトは `shell` コマンドでデバイス内
+   シェルに入ります。このときデバイスが `Password:` を再度要求することがあり、
+   `bulk-show.py` は `PASSWORD_PROMPT_RE` でこれを検出し、**同じパスワードを自動で再送**
+   します。
+
+2 回目のプロンプトでパスワードが拒否された場合、セッションは `auth_error_shell`
+ステータスで終了し、ログに明示的なメッセージが残ります。**両方のプロンプトで
+同じパスワードを使ってください**。現状、トランスポート層とシェル層で異なる
+資格情報を使い分ける機能はありません。
+
 実行例（新オプション）:
 
 ```bash
-# 既定の SSH ポート (830) と並列度を抑えた実行
+# 既定の SSH ポート (830, SD-WAN 用) と並列度を抑えた実行
 python3 bulk-show.py host.txt command.txt --max-workers 4
 
-# 標準 SSH ポートに変更
+# SSH ポートを上書き（SD-WAN 以外の機器に対し、慣例の 22 を使う場合のみ）
 python3 bulk-show.py host.txt command.txt --port 22
 
 # 一過性失敗を 3 回まで 10 秒間隔でリトライ（auth failure はリトライ対象外）

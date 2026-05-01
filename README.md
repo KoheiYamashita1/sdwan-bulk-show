@@ -133,7 +133,7 @@ python3 bulk-show.py host.txt command.txt --reject-unknown-hosts
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--port PORT` | `830` | SSH TCP port used for every host. |
+| `--port PORT` | `830` | SSH TCP port used for every host. SD-WAN edges (cEdge / IOS-XE SD-WAN) expose the interactive SSH service used by vManage `vshell` on 830, **not** 22. Override only for non-SD-WAN devices. |
 | `--reject-unknown-hosts` | off (auto-add + WARN) | Reject host keys not present in `~/.ssh/known_hosts` (MITM protection). |
 | `--password-prompt` | off | Prompt once for a shared password and override any embedded passwords. |
 | `--logs-dir LOGS_DIR` | `logs` | Directory where output files are written. |
@@ -142,13 +142,32 @@ python3 bulk-show.py host.txt command.txt --reject-unknown-hosts
 | `--retry-delay SECS` | `5.0` | Seconds to sleep between connect attempts. |
 | `--output-format LIST` | `text` | Comma-separated; combine any of `text,json,csv`. Each format produces an additional per-host file. |
 
+## SD-WAN authentication notes
+
+When `bulk-show.py` is launched from the vManage `vshell` (the recommended
+deployment via `run_on_vmanage.py`), each SD-WAN edge is reached on
+**TCP/830** and the device asks for the password **twice**:
+
+1. **SSH transport layer** — the password supplied via the hosts file or the
+   `--password-prompt` flow is sent as part of the SSH handshake.
+2. **Device sub-shell** — after the connection is established, the script
+   sends `shell` to drop into the device shell and the device may re-prompt
+   for the same password (`Password:`). `bulk-show.py` detects this prompt
+   (`PASSWORD_PROMPT_RE`) and replays the same password automatically.
+
+If the second prompt rejects the password, the session ends with status
+`auth_error_shell` and an explicit message in the log. **Use the same
+password for both prompts**; the script does not currently support distinct
+transport- vs shell-level credentials.
+
 Examples (new options):
 
 ```bash
-# Default SSH port (830) with bounded parallelism.
+# Default SSH port (830, SD-WAN) with bounded parallelism.
 python3 bulk-show.py host.txt command.txt --max-workers 4
 
-# Switch to standard SSH port.
+# Override the SSH port (only needed for non-SD-WAN devices that
+# use the conventional port 22).
 python3 bulk-show.py host.txt command.txt --port 22
 
 # Retry transient connect failures up to 3 times, 10s apart (auth failures

@@ -338,7 +338,11 @@ def connect_and_execute(
         output_paths: dict mapping output format -> destination file path.
             Use OUTPUT_FORMAT_TEXT/JSON/CSV as keys. May contain multiple.
         allow_unknown_hosts: if False, unknown SSH host keys are rejected.
-        port: SSH TCP port to connect to (Issue 11). Default 830.
+        port: SSH TCP port to connect to (Issue 11). Default 830 because
+            Cisco SD-WAN edges (cEdge / IOS-XE SD-WAN) expose the
+            interactive SSH service for ``vshell``-initiated sessions on
+            port 830, not the conventional 22. Override with --port when
+            connecting to non-SD-WAN devices.
         retries: number of additional SSH connect attempts after the first
             one fails on a transient network/SSH error (Issue 12). Auth
             failures are NEVER retried because they will not fix themselves.
@@ -603,7 +607,7 @@ if __name__ == "__main__":
             "    python3 bulk-show.py hosts.txt commands.txt --password-prompt\n"
             "  Reject unknown SSH host keys (production):\n"
             "    python3 bulk-show.py hosts.txt commands.txt --reject-unknown-hosts\n"
-            "  Custom SSH port and bounded parallelism:\n"
+            "  Override SSH port (e.g. non-SD-WAN device on 22) and cap parallelism:\n"
             "    python3 bulk-show.py hosts.txt commands.txt --port 22 --max-workers 8\n"
             "  Retry transient connect failures three times, 10s apart:\n"
             "    python3 bulk-show.py hosts.txt commands.txt --retries 3 --retry-delay 10\n"
@@ -626,7 +630,12 @@ if __name__ == "__main__":
         "--port",
         type=int,
         default=830,
-        help="SSH TCP port to connect to on every host (default: 830).",
+        help=(
+            "SSH TCP port to connect to on every host (default: 830). "
+            "Cisco SD-WAN edges expose the interactive SSH service used by "
+            "vManage vshell on 830; override only when targeting "
+            "non-SD-WAN devices that use the conventional 22."
+        ),
     )
     parser.add_argument(
         "--reject-unknown-hosts",
