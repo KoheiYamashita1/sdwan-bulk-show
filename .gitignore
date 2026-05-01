@@ -1,4 +1,8 @@
 logs/
 output_*.txt
+output_*.json
+output_*.csv
 host.txt
 command.txt
+__pycache__/
+*.pyc
