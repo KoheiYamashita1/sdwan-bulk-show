@@ -2,12 +2,22 @@ import argparse
 import getpass
 import os
 import pathlib
+import re
 import sys
 import time
 
 import paramiko
 
 VERBOSE = False
+
+# vManage CLI mode prompt: hostname + (# or >). Excludes ':' to avoid colliding
+# with vshell prompts like "vmanage:~#".
+# Examples that match: "vmanage#", "vmanage-01#", "primary-vmanage>"
+CLI_PROMPT_RE = re.compile(r"(?:^|\n)[^\s:]+[#>]\s*\Z")
+
+# vshell (Linux shell) prompt: hostname + ":~" + ($ or #).
+# Examples that match: "vmanage:~$", "vmanage-01:~#"
+SHELL_PROMPT_RE = re.compile(r"(?:^|\n)\S+:~[#$]\s*\Z")
 
 
 def log(message):
@@ -94,6 +104,12 @@ def parse_args():
         help="Show detailed remote output",
     )
     parser.add_argument(
+        "--reject-unknown-hosts",
+        action="store_true",
+        help="Reject the SSH connection if the vManage host key is not in known_hosts "
+             "(safer; protects against MITM). Default: auto-add unknown keys.",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Only print essential logs",
@@ -101,95 +117,78 @@ def parse_args():
     return parser.parse_args()
 
 
-def expand_remote_path(remote_path):
-    if remote_path.startswith("~/"):
-        return remote_path
-    if remote_path == "~":
-        return remote_path
-    return remote_path
+def resolve_remote_dir(sftp, remote_dir):
+    """Expand leading '~' and resolve to an absolute path on the SFTP server.
+
+    SFTP itself does not interpret '~' (it's a shell construct), so we expand
+    it explicitly using the SFTP session's working directory, which on most
+    servers is the user's home directory at login time. This guarantees that
+    subsequent sftp.mkdir/stat/put receive a real absolute path rather than
+    the literal "~" character.
+
+    - "~"            -> "<home>"
+    - "~/<rest>"     -> "<home>/<rest>"
+    - "/abs/path"    -> returned as-is
+    - "rel/path"     -> "<home>/rel/path" (treated as relative to home)
+    """
+    if remote_dir == "~":
+        return sftp.normalize(".")
+    if remote_dir.startswith("~/"):
+        return f"{sftp.normalize('.')}/{remote_dir[2:]}"
+    if remote_dir.startswith("/"):
+        return remote_dir
+    # Relative path: anchor to home for predictable behavior
+    return f"{sftp.normalize('.')}/{remote_dir}"
 
 
 def sftp_mkdir_p(sftp, remote_dir):
-    parts = pathlib.PurePosixPath(remote_dir).parts
+    """Create remote_dir and any missing parent directories (idempotent).
+
+    `remote_dir` MUST be an absolute path. Use resolve_remote_dir() first
+    to expand '~' or relative paths before calling this function.
+    """
+    if not remote_dir.startswith("/"):
+        raise ValueError(
+            f"sftp_mkdir_p requires an absolute path (got: {remote_dir!r}). "
+            "Call resolve_remote_dir(sftp, ...) first to expand '~' or relative paths."
+        )
+    parts = pathlib.PurePosixPath(remote_dir).parts  # e.g., ('/', 'home', 'sdwan')
     path = ""
     for part in parts:
-        if part == "~":
-            path = "~"
+        if part == "/":
+            path = "/"
             continue
-        if path in ("", "/"):
-            path = f"/{part}"
-        elif path == "~":
-            path = f"~/{part}"
-        else:
-            path = f"{path}/{part}"
+        path = f"{path}{part}" if path == "/" else f"{path}/{part}"
         try:
             sftp.stat(path)
         except FileNotFoundError:
             sftp.mkdir(path)
 
 
-def remote_exists(sftp, path):
-    try:
-        sftp.stat(path)
-        return True
-    except FileNotFoundError:
-        return False
+def read_until_re(channel, prompt_re, max_wait=30.0):
+    """Read from `channel` until `prompt_re` matches the buffer tail or `max_wait` elapses.
 
-
-def confirm_overwrite(remote_paths, force):
-    if not remote_paths:
-        return True
-    return True
-
-
-def read_channel(channel, idle_timeout=1.0, max_wait=10.0):
-    channel.settimeout(idle_timeout)
-    chunks = []
-    start = time.monotonic()
-    last_data = start
-    while True:
-        now = time.monotonic()
-        if now - start >= max_wait:
-            break
-        try:
-            data = channel.recv(4096)
-            if not data:
-                break
-            chunks.append(data.decode(errors="replace"))
-            last_data = now
-        except Exception:
-            if now - last_data >= idle_timeout:
-                break
-    return "".join(chunks)
-
-
-def run_remote_command(ssh, command, get_pty=False):
-    stdin, stdout, stderr = ssh.exec_command(command, get_pty=get_pty)
-    stdin.close()
-    out = stdout.read().decode(errors="replace")
-    err = stderr.read().decode(errors="replace")
-    exit_status = stdout.channel.recv_exit_status()
-    return out, err, exit_status
-
-
-def read_until_any(channel, patterns, max_wait=30.0):
+    Matching only the tail (last 256 chars) avoids accidental matches against earlier
+    output (e.g., command echo) and keeps the regex cheap on large buffers.
+    Returns (buffer, matched_bool).
+    """
     end_time = time.monotonic() + max_wait
     buffer = ""
     while time.monotonic() < end_time:
         if channel.recv_ready():
             data = channel.recv(4096).decode(errors="replace")
             buffer += data
-            for pattern in patterns:
-                if pattern in buffer:
-                    return buffer, pattern
+            tail = buffer[-256:] if len(buffer) > 256 else buffer
+            if prompt_re.search(tail):
+                return buffer, True
         else:
             time.sleep(0.2)
-    return buffer, None
+    return buffer, False
 
 
-def run_vshell_command(channel, command, prompt_patterns, max_wait=60.0):
+def run_vshell_command(channel, command, prompt_re, max_wait=60.0):
     channel.send(f"{command}\n")
-    output, _ = read_until_any(channel, prompt_patterns, max_wait=max_wait)
+    output, _ = read_until_re(channel, prompt_re, max_wait=max_wait)
     return output
 
 
@@ -216,7 +215,17 @@ def main():
 
     ssh = paramiko.SSHClient()
     ssh.load_system_host_keys()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    if args.reject_unknown_hosts:
+        ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+    else:
+        print(
+            f"[WARN] Auto-accepting unknown SSH host key for {args.vmanage_host} "
+            "(MITM risk). Re-run with --reject-unknown-hosts after the host is "
+            "registered in ~/.ssh/known_hosts to enforce verification.",
+            file=sys.stderr,
+            flush=True,
+        )
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     connect_kwargs = {
         "hostname": args.vmanage_host,
@@ -239,14 +248,16 @@ def main():
     if not args.quiet:
         log(f"[{args.vmanage_host}] connected")
 
-    remote_base = expand_remote_path(args.remote_dir)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    remote_dir = f"{remote_base}/{timestamp}"
-    if not args.quiet:
-        log(f"[{args.vmanage_host}] using remote dir: {remote_dir}")
     local_logs_dir = local_dir / "logs" / timestamp
     sftp = ssh.open_sftp()
     try:
+        # Expand '~' / relative paths against the SFTP server's home directory
+        # before any sftp.mkdir/stat call (SFTP does not interpret '~' itself).
+        remote_base = resolve_remote_dir(sftp, args.remote_dir)
+        remote_dir = f"{remote_base}/{timestamp}"
+        if not args.quiet:
+            log(f"[{args.vmanage_host}] using remote dir: {remote_dir}")
         sftp_mkdir_p(sftp, remote_dir)
     finally:
         sftp.close()
@@ -258,14 +269,6 @@ def main():
         remote_bulk = f"{remote_dir}/{bulk_script.name}"
         remote_hosts = f"{remote_dir}/{hosts_file.name}"
         remote_commands = f"{remote_dir}/{commands_file.name}"
-        existing = [
-            path
-            for path in (remote_bulk, remote_hosts, remote_commands)
-            if remote_exists(sftp, path)
-        ]
-        if not confirm_overwrite(existing, True):
-            log("Upload cancelled.")
-            return
         if not args.quiet:
             log(f"[{args.vmanage_host}] uploading files to {remote_dir}")
         sftp.put(str(bulk_script), remote_bulk)
@@ -283,14 +286,14 @@ def main():
     if not args.quiet:
         log(f"[{args.vmanage_host}] running via vshell session")
     shell = ssh.invoke_shell()
-    read_until_any(shell, ["vmanage#", "vmanage>"], max_wait=10.0)
-    run_vshell_command(shell, "vshell", ["vmanage:~$", "vmanage:~#"], max_wait=10.0)
+    read_until_re(shell, CLI_PROMPT_RE, max_wait=10.0)
+    run_vshell_command(shell, "vshell", SHELL_PROMPT_RE, max_wait=10.0)
 
     try:
         out = run_vshell_command(
             shell,
             remote_cmd,
-            ["vmanage:~$", "vmanage:~#"],
+            SHELL_PROMPT_RE,
             max_wait=600.0,
         )
     except Exception as exc:
@@ -304,16 +307,19 @@ def main():
 
     if VERBOSE:
         log(f"[{args.vmanage_host}] latest remote logs:")
-    try:
-        logs_out = run_vshell_command(
-            shell,
-            f"ls -lt {remote_logs_dir} | head -n 5",
-            ["vmanage:~$", "vmanage:~#"],
-            max_wait=10.0,
-        )
-    except Exception as exc:
-        print(f"[{args.vmanage_host}] remote logs error: {exc}", file=sys.stderr)
-        sys.exit(1)
+        logs_out = ""
+        try:
+            logs_out = run_vshell_command(
+                shell,
+                f"ls -lt {remote_logs_dir} | head -n 5",
+                SHELL_PROMPT_RE,
+                max_wait=10.0,
+            )
+        except Exception as exc:
+            print(
+                f"[{args.vmanage_host}] remote logs warning: {exc} (continuing)",
+                file=sys.stderr,
+            )
         if logs_out.strip():
             for line in logs_out.splitlines():
                 vlog(line.rstrip())
@@ -323,7 +329,7 @@ def main():
         if not args.quiet:
             log(f"[{args.vmanage_host}] remote logs: (use --verbose to show)")
 
-    run_vshell_command(shell, "exit", ["vmanage#", "vmanage>"], max_wait=10.0)
+    run_vshell_command(shell, "exit", CLI_PROMPT_RE, max_wait=10.0)
     shell.close()
 
     if args.download_outputs:
