@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Past runs · sdwan-bulk-show{% endblock %}
+{% block content %}
+  <h1>Past runs</h1>
+  <p class="lede">
+    Newest first, scanned from <code>logs/</code>. Click any timestamp for the
+    per-host output files and the run manifest.
+  </p>
+
+  {% if runs %}
+    <table class="runs">
+      <thead>
+        <tr>
+          <th>Timestamp</th>
+          <th>vManage</th>
+          <th>Status</th>
+          <th>Outputs</th>
+          <th>Files in dir</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for run in runs %}
+          <tr>
+            <td><a href="/runs/{{ run.timestamp }}"><code>{{ run.timestamp }}</code></a></td>
+            <td>{{ run.vmanage_host or "—" }}</td>
+            <td>
+              <span class="status status--{{ run.status }}">{{ run.status }}</span>
+              {% if run.returncode is not none %}
+                <small>(rc={{ run.returncode }})</small>
+              {% endif %}
+            </td>
+            <td>
+              {% if run.manifest %}
+                {{ run.manifest.outputs_count }}
+              {% else %}—{% endif %}
+            </td>
+            <td>{{ run.file_count }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">No runs yet. Submit the form on the <a href="/">Run page</a>.</p>
+  {% endif %}
+{% endblock %}

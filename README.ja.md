@@ -1,6 +1,15 @@
 # sdwan-bulk-show
 
-このリポジトリは、vManage上で bulk-show.py を実行して複数のSD-WAN機器のログを収集するラッパーを提供します。
+このリポジトリは、SD-WAN 機器に対して `bulk-show.py` を一括実行する3通りの
+方法を提供します。
+
+1. [`run_on_vmanage.py`](run_on_vmanage.py) — vManage に `bulk-show.py` を
+   送り込み、`vshell` 内で実行してログを手元に回収する CLI ラッパー（推奨）。
+2. [`webapp/`](webapp/) — `python -m webapp` で起動する FastAPI + Uvicorn 製の
+   小さなローカル Web UI。`127.0.0.1` のブラウザから同じラッパーを呼び出します。
+   詳細は [Web UI（ローカルブラウザ）](#web-uiローカルブラウザ) を参照してください。
+3. [`bulk-show.py`](bulk-show.py) — SD-WAN エッジに直接 SSH 到達できる端末
+   から動かす素のスクリプト。
 
 English: README.md
 Japanese: README.ja.md
@@ -79,6 +88,200 @@ python3 run_on_vmanage.py <vManage FQDN/IPaddress> --user <username> --key ~/.ss
 - 既定では未知のSSHホストキーを自動受け入れし、警告を stderr に出力します（中間者攻撃のリスクあり）。
 本番環境では、初回接続後（またはホストキーを事前登録した上で）--reject-unknown-hosts を付与して
 厳格な検証を有効にしてください。
+
+# Web UI（ローカルブラウザ）
+
+[`webapp/`](webapp/) には `run_on_vmanage.py` を CLI 越しではなくブラウザから
+呼び出すための、FastAPI + Uvicorn 製の小さなアプリが入っています。
+本 v1 は **オペレータ自身の Mac でローカルにのみ動かす単一ユーザ向け** であり、
+サーバは `127.0.0.1` のみをバインドし、組み込み認証はありません。
+
+## 起動方法
+
+```bash
+cd /path/to/sdwan-bulk-show
+python3 -m venv .venv                            # まだ無い場合
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt        # fastapi / uvicorn[standard] / jinja2 / python-multipart が追加されます
+python -m webapp                                  # http://127.0.0.1:8000 で起動
+# ブラウザで http://127.0.0.1:8000/ を開いてください。
+```
+
+主なオプション（`python -m webapp --help` 参照）:
+
+```bash
+python -m webapp --port 8081                      # ローカルポート変更
+python -m webapp --log-level warning              # uvicorn のログを抑制
+python -m webapp --reload                          # uvicorn 自動リロード（開発用）
+python -m webapp --host 0.0.0.0                   # 非推奨。下の「セキュリティ注意」参照
+```
+
+Web UI は単一プロセスのフォアグラウンド Uvicorn として動きます。停止は同じ
+ターミナルで `Ctrl-C` を押してください。
+
+## ルーティング
+
+| メソッド | パス                              | 用途 |
+| -------- | --------------------------------- | ---- |
+| `GET`    | `/`                               | 実行フォーム。vManage host / SSH user / password / remote-dir / hosts テキスト / commands テキスト / オプション。 |
+| `POST`   | `/run`                            | 入力検証 → tempdir に `host.txt` / `command.txt` を 0o600 で書き出し → `run_on_vmanage.py` を `stdin` 経由でパスワードを渡しながら起動 → `303 See Other` で `/runs/<timestamp>` へリダイレクト。 |
+| `GET`    | `/runs`                           | `logs/<timestamp>/` をスキャンして実行履歴を新しい順に一覧表示。 |
+| `GET`    | `/runs/<timestamp>`               | 1 ランのサマリ（vManage host, user, hosts/commands 数, returncode, ステータス, 所要時間）と `output_*.txt` / `manifest.json` / `run.log` の一覧。 |
+| `GET`    | `/runs/<timestamp>/files/<name>` | 個別ログ表示。パストラバーサルとシンボリックリンクは厳格に拒否。 |
+| `GET`    | `/healthz`                        | 動作確認。`{"status": "ok"}` を返します。 |
+
+## CLI とのマッピング
+
+Web UI は CLI を **置き換えるのではなくラップする** だけです。フォーム送信
+1 回ごとに、概ね次と等価な subprocess が起動されます:
+
+```bash
+python3 run_on_vmanage.py <vmanage-host> \
+  --user <user> --remote-dir <remote-dir> \
+  --local-dir <tempdir> --hosts host.txt --commands command.txt \
+  --download-outputs \
+  [--verbose] [--reject-unknown-hosts]
+```
+
+裏側で [`webapp/runner.py`](webapp/runner.py) が以下を担います:
+
+- パスワードはフォームから受け取った値を subprocess の `stdin` に流し込みます
+  （TTY が無い場合 `getpass` は `stdin` から読むため成立）。**ディスクには
+  書き出しません。**
+- 標準出力 / 標準エラーをまとめて取得し、`form.password` 文字列を `***` に
+  マスクしてから `logs/<timestamp>/run.log` に保存します。
+- 取得した output と並べて `manifest.json` を生成します（実体は
+  `webapp.runner._build_manifest` が組み立てています）:
+
+  ```json
+  {
+    "timestamp": "20260502_031530",
+    "vmanage_host": "192.0.2.10",
+    "vmanage_user": "admin",
+    "remote_dir": "/home/admin",
+    "hosts_count": 5,
+    "commands_count": 3,
+    "options": {
+      "download_outputs": true,
+      "verbose": false,
+      "reject_unknown_hosts": false
+    },
+    "started_at": "2026-05-02T03:15:30+09:00",
+    "ended_at": "2026-05-02T03:15:37+09:00",
+    "duration_sec": 7.2,
+    "returncode": 0,
+    "outputs_count": 2,
+    "outputs": ["output_2.1.1.1.txt", "output_2.1.1.2.txt"],
+    "status": "success"
+  }
+  ```
+
+  `status` フィールドは `success` (returncode 0)、`failed` (returncode 非 0)、
+  `timeout` (`DEFAULT_RUN_TIMEOUT` 超過) のいずれかになります。
+
+## 同時実行と上限
+
+- v1 ではプロセス内 `threading.Lock` で実行をシリアライズします。実行中に
+  もう一度 `POST /run` すると HTTP `409 Conflict` を返し、フォームに警告
+  バナーを出して再描画します。
+- hosts / commands テキストはそれぞれ **1 MiB** まで（`webapp.runner.MAX_INPUT_BYTES`）。
+- 1 回の subprocess のタイムアウトは既定 **1800 秒**
+  （`webapp.runner.DEFAULT_RUN_TIMEOUT`）。タイムアウト時は `timeout`
+  ステータスで途中までの transcript を保存します。
+- ファイルビューアは **5 MiB** まで表示（`webapp.storage.MAX_VIEW_BYTES`）。
+  超過分は切り詰め、何バイト落としたかをバナー表示します。
+
+## 画面構成（ASCII イメージ）
+
+`GET /` — 実行フォーム:
+
+```
++-------------------------------------------------------------+
+| sdwan-bulk-show                              [Run] [履歴]   |
++-------------------------------------------------------------+
+| vManage host: [vmanage.example.com                      ]    |
+| SSH user:     [admin           ]  Password: [**********]     |
+| Remote dir:   [/home/admin                              ]    |
+|                                                              |
+| Hosts (1 行 1 ホスト, IP[,user[,password]]):                 |
+| +----------------------------------------------------------+ |
+| | 2.1.1.1,admin                                            | |
+| | 2.1.1.2,admin                                            | |
+| +----------------------------------------------------------+ |
+|                                                              |
+| Commands (1 行 1 コマンド):                                  |
+| +----------------------------------------------------------+ |
+| | show version                                             | |
+| | show sdwan control connections                           | |
+| +----------------------------------------------------------+ |
+|                                                              |
+| [x] Download outputs   [ ] Verbose   [ ] Reject unknown hosts|
+|                                                              |
+|                                            [ Run on vManage ]|
++-------------------------------------------------------------+
+```
+
+`GET /runs/<timestamp>` — 1 ラン詳細:
+
+```
++-------------------------------------------------------------+
+| Run 20260502_031530   status: success   duration: 7.20 s    |
+| vManage 192.0.2.10      user admin   hosts 2   commands 2   |
++-------------------------------------------------------------+
+| Files                                                       |
+|  - manifest.json                                            |
+|  - run.log                                                  |
+|  - output_2.1.1.1.txt                                       |
+|  - output_2.1.1.2.txt                                       |
++-------------------------------------------------------------+
+```
+
+（実画面のスクリーンショットはブラウザで取得してください。レイアウトは
+JavaScript なしで動く最小 HTML/CSS で構成しています。）
+
+## セキュリティ注意 — Web UI を使う前に必読
+
+- **既定はローカル限定。** バインドアドレスは `127.0.0.1:8000` です。
+  `--host 0.0.0.0` は使わないでください。v1 は認証・レート制限・TLS の
+  いずれも持ちません。Web UI をネットワークに晒すことは、シェルアクセスと
+  vManage クレデンシャルを配るのとほぼ同じ意味になります。別ホストから
+  触る必要がある場合は SSH トンネル
+  （`ssh -L 8000:127.0.0.1:8000 your-mac`）か、認証を足したリバースプロキシ
+  を前段に置いてください。バインド先がループバックでない時、ランナーは
+  `WARNING` を出します。
+- **パスワードはメモリ常駐 + ログマスク。** 受け取ったパスワードは
+  subprocess の `stdin` に流し込むだけで、ディスクには書きません。
+  `run.log` を保存する直前に `form.password` の出現箇所を `***` に
+  置換しているので、`logs/<timestamp>/run.log` を開いて漏えいが無いことを
+  必ず確認してください。
+- **hosts / commands は private tempdir に置く。** 入力テキストは
+  `tempfile.TemporaryDirectory()` 内に `0o600` で展開し、subprocess 終了と
+  ともに削除されます。ダウンロードした outputs が `logs/<timestamp>/` に
+  残るのは CLI と同じレイアウトです。
+- **パストラバーサルは遮断。** `/runs/<timestamp>/files/<name>` は要求
+  パスを `logs/<timestamp>/` 配下で resolve し、ディレクトリを抜ける
+  パスやシンボリックリンクは拒否します。`/`, `\`, `..` を含むファイル名は
+  `404` です。
+- **実行はシリアル化。** 並行実行は許可しません。同時に `POST /run` する
+  と 2 件目は `409 Conflict` でフォームに戻ります。
+- **ブラウザのオートフィル。** モダンブラウザは vManage パスワードを保存
+  する提案を出すことがあります。キーチェーンに残したくない場合は拒否して
+  ください。
+- **ログは自動削除しません。** `logs/` は実行ごとに増えます。容量が気に
+  なる場合はタイムスタンプ付きディレクトリを手動で削除してください。
+  Web UI 側からランを削除する操作はありません。
+
+下の [セキュリティに関する推奨](#セキュリティに関する推奨) も併せて参照
+してください。Web UI が内部で利用する CLI フラグの推奨設定を扱っています。
+
+## 今後の拡張余地（v1 では未実装）
+
+- subprocess 出力のライブストリーミング（`/runs/<ts>/stream` を SSE で配信）。
+- 名前付きホストインベントリ（`inventories/<name>.txt` 保存。パスワードは
+  保存しない選択肢を必ず残す）。
+- 非同期ジョブキューによる並列実行。
+- `WEBAPP_TOKEN` 環境変数を見て Bearer トークン認証を有効化。
 
 # bulk-show.py (直接実行)
 

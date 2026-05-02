@@ -6,3 +6,8 @@ host.txt
 command.txt
 __pycache__/
 *.pyc
+
+# transient artefacts from local tooling
+.playwright-mcp/
+webui-index.png
+amp

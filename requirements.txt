@@ -1,1 +1,5 @@
 paramiko
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart

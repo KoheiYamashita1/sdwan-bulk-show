@@ -1,6 +1,16 @@
 # sdwan-bulk-show
 
-This repo provides a wrapper to run bulk-show.py on vManage and collect logs from multiple SD-WAN devices.
+This repo provides three ways to run `bulk-show.py` against a fleet of SD-WAN
+devices:
+
+1. [`run_on_vmanage.py`](run_on_vmanage.py) — CLI wrapper that ships
+   `bulk-show.py` to vManage, executes it inside `vshell`, and pulls the logs
+   back to your laptop.
+2. [`webapp/`](webapp/) — a small FastAPI + Uvicorn UI (`python -m webapp`)
+   that drives the same wrapper from a browser on `127.0.0.1`. See
+   [Web UI (local browser)](#web-ui-local-browser).
+3. [`bulk-show.py`](bulk-show.py) — the underlying script you can run directly
+   from anywhere that has SSH reachability to the SD-WAN edges.
 
 English: README.md
 Japanese: README.ja.md
@@ -78,6 +88,204 @@ and writes logs to //logs.
 - By default, unknown SSH host keys are auto-accepted and a warning is printed to stderr (MITM risk).
 Add --reject-unknown-hosts after the first connection (or pre-register the host key) to enforce
 strict verification in production.
+
+# Web UI (local browser)
+
+A small FastAPI + Uvicorn app under [`webapp/`](webapp/) wraps
+`run_on_vmanage.py` so you can drive a run from a browser instead of the CLI.
+The UI is intended for **single-user, local use on the operator's machine** —
+the server binds to `127.0.0.1` only and there is no built-in authentication.
+
+## Launching the web UI
+
+```bash
+cd /path/to/sdwan-bulk-show
+python3 -m venv .venv                            # if you do not already have one
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt        # adds fastapi, uvicorn[standard], jinja2, python-multipart
+python -m webapp                                  # starts http://127.0.0.1:8000
+# Open http://127.0.0.1:8000/ in your browser.
+```
+
+Optional flags (see `python -m webapp --help`):
+
+```bash
+python -m webapp --port 8081                      # change the local port
+python -m webapp --log-level warning              # quieter uvicorn logs
+python -m webapp --reload                          # uvicorn auto-reload (dev only)
+python -m webapp --host 0.0.0.0                   # NOT RECOMMENDED — see "Security notes" below
+```
+
+The webapp runs as a single foreground Uvicorn process. Hit `Ctrl-C` in the
+same terminal to stop it.
+
+## Routes
+
+| Method | Path                              | Purpose |
+| ------ | --------------------------------- | ------- |
+| `GET`  | `/`                               | Run form: vManage host, SSH user, password, remote-dir, hosts text, commands text, options. |
+| `POST` | `/run`                            | Validate inputs, write `host.txt` / `command.txt` to a private tempdir, spawn `run_on_vmanage.py` with the password piped via `stdin`, then `303 See Other` to `/runs/<timestamp>`. |
+| `GET`  | `/runs`                           | List past runs (newest first) by scanning `logs/<timestamp>/`. |
+| `GET`  | `/runs/<timestamp>`               | Per-run summary (vManage host, user, hosts/commands counts, returncode, status, duration) plus the list of `output_*.txt`, `manifest.json`, and `run.log`. |
+| `GET`  | `/runs/<timestamp>/files/<name>` | View an individual log file with strict path-traversal guards. |
+| `GET`  | `/healthz`                        | Liveness probe; returns `{"status": "ok"}`. |
+
+## How the web UI maps to the CLI
+
+The web UI is a thin wrapper — it does not replace `run_on_vmanage.py`. Each
+form submission becomes a normal subprocess invocation roughly equivalent to:
+
+```bash
+python3 run_on_vmanage.py <vmanage-host> \
+  --user <user> --remote-dir <remote-dir> \
+  --local-dir <tempdir> --hosts host.txt --commands command.txt \
+  --download-outputs \
+  [--verbose] [--reject-unknown-hosts]
+```
+
+Behind the scenes the runner ([`webapp/runner.py`](webapp/runner.py)):
+
+- Pipes the submitted password to the subprocess `stdin` (the existing
+  `getpass` fallback reads from `stdin` when there is no TTY), so the password
+  never lands on disk.
+- Captures combined stdout/stderr, replaces every occurrence of the password
+  with `***`, and writes the masked transcript to
+  `logs/<timestamp>/run.log`.
+- Generates a `manifest.json` next to the downloaded outputs (built by
+  `webapp.runner._build_manifest`):
+
+  ```json
+  {
+    "timestamp": "20260502_031530",
+    "vmanage_host": "192.0.2.10",
+    "vmanage_user": "admin",
+    "remote_dir": "/home/admin",
+    "hosts_count": 5,
+    "commands_count": 3,
+    "options": {
+      "download_outputs": true,
+      "verbose": false,
+      "reject_unknown_hosts": false
+    },
+    "started_at": "2026-05-02T03:15:30+09:00",
+    "ended_at": "2026-05-02T03:15:37+09:00",
+    "duration_sec": 7.2,
+    "returncode": 0,
+    "outputs_count": 2,
+    "outputs": ["output_2.1.1.1.txt", "output_2.1.1.2.txt"],
+    "status": "success"
+  }
+  ```
+
+  The `status` field is one of `success` (returncode 0), `failed` (non-zero
+  returncode), or `timeout` (exceeded `DEFAULT_RUN_TIMEOUT`).
+
+## Concurrency and limits
+
+- v1 serializes runs with an in-process `threading.Lock`. While a run is in
+  progress, a second `POST /run` returns HTTP `409 Conflict` and re-renders
+  the form with an error banner.
+- Hosts and commands text inputs are each capped at **1 MiB**
+  (`webapp.runner.MAX_INPUT_BYTES`) before being written to disk.
+- Each subprocess invocation has a default timeout of **1800 s**
+  (`webapp.runner.DEFAULT_RUN_TIMEOUT`); on timeout the run is marked
+  `timeout` and the partial transcript is saved.
+- The file viewer caps responses at **5 MiB**
+  (`webapp.storage.MAX_VIEW_BYTES`); larger files are truncated and a banner
+  notes how many bytes were dropped.
+
+## UI overview (ASCII wireframes)
+
+`GET /` — run form:
+
+```
++-------------------------------------------------------------+
+| sdwan-bulk-show                              [Run] [History]|
++-------------------------------------------------------------+
+| vManage host:  [vmanage.example.com                      ]   |
+| SSH user:      [admin           ]  Password: [**********]    |
+| Remote dir:    [/home/admin                              ]   |
+|                                                              |
+| Hosts (one per line, IP[,user[,password]]):                  |
+| +----------------------------------------------------------+ |
+| | 2.1.1.1,admin                                            | |
+| | 2.1.1.2,admin                                            | |
+| +----------------------------------------------------------+ |
+|                                                              |
+| Commands (one per line):                                     |
+| +----------------------------------------------------------+ |
+| | show version                                             | |
+| | show sdwan control connections                           | |
+| +----------------------------------------------------------+ |
+|                                                              |
+| [x] Download outputs   [ ] Verbose   [ ] Reject unknown hosts|
+|                                                              |
+|                                            [ Run on vManage ]|
++-------------------------------------------------------------+
+```
+
+`GET /runs/<timestamp>` — run detail:
+
+```
++-------------------------------------------------------------+
+| Run 20260502_031530   status: success   duration: 7.20 s    |
+| vManage 192.0.2.10      user admin   hosts 2   commands 2   |
++-------------------------------------------------------------+
+| Files                                                       |
+|  - manifest.json                                            |
+|  - run.log                                                  |
+|  - output_2.1.1.1.txt                                       |
+|  - output_2.1.1.2.txt                                       |
++-------------------------------------------------------------+
+```
+
+(Open the page in your browser to capture real screenshots; the layout is
+intentionally minimal HTML/CSS so it works without JavaScript.)
+
+## Security notes — read this before pointing the web UI at production
+
+- **Local-only by default.** The default bind is `127.0.0.1:8000`. Do not
+  pass `--host 0.0.0.0`. There is no authentication, no rate limiting, and
+  no TLS in v1 — exposing the web UI on a network is roughly equivalent to
+  handing out shell access plus your vManage credentials. If you must
+  reach it from another host, prefer an SSH tunnel
+  (`ssh -L 8000:127.0.0.1:8000 your-mac`) or a reverse proxy that adds
+  authentication. The runner logs a `WARNING` whenever the bind address is
+  not on the loopback interface.
+- **Passwords stay in memory and are masked in logs.** The submitted password
+  is piped to the subprocess `stdin` and is never written to disk. Before
+  `run.log` is persisted, the runner replaces every occurrence of the
+  password with `***`. Inspect `logs/<timestamp>/run.log` after a run to
+  confirm there is no leakage.
+- **Hosts/commands inputs live in a private tempdir.** The submitted text is
+  staged in a `tempfile.TemporaryDirectory()` with `0o600` permissions for
+  the lifetime of the subprocess, then deleted. The downloaded outputs in
+  `logs/<timestamp>/` follow the same on-disk layout as the CLI.
+- **Path traversal is blocked.** `/runs/<timestamp>/files/<name>` resolves
+  the requested path inside `logs/<timestamp>/` and rejects anything that
+  escapes the run directory or follows a symlink. Filenames containing `/`,
+  `\`, or `..` return `404`.
+- **Runs are serialized.** A `threading.Lock` allows one active run at a
+  time. A second concurrent submit returns `409 Conflict` and re-renders the
+  form with an error banner.
+- **Browser autofill.** Modern browsers may offer to remember the vManage
+  password. Decline if you do not want it persisted in your browser
+  keychain.
+- **Logs are not pruned automatically.** Old runs accumulate under `logs/`.
+  Delete unused timestamp directories manually if disk usage becomes a
+  concern; the web UI never deletes runs on your behalf.
+
+See also the cross-cutting [Security recommendations](#security-recommendations)
+section below, which covers the underlying CLI flags consumed by the web UI.
+
+## Future extensions (not in v1)
+
+- Live streaming of subprocess output (`/runs/<ts>/stream` over SSE).
+- Named host inventories (`inventories/<name>.txt`) — store the hosts file
+  but never the password.
+- Parallel runs via an async job queue.
+- Optional bearer-token auth gated by a `WEBAPP_TOKEN` environment variable.
 
 # bulk-show.py (direct)
 

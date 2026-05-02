@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}sdwan-bulk-show Web UI{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar__inner">
+      <a class="brand" href="/">sdwan-bulk-show</a>
+      <nav class="nav">
+        <a href="/" class="nav__link">Run</a>
+        <a href="/runs" class="nav__link">Runs</a>
+      </nav>
+    </div>
+  </header>
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="footer">
+    <p>Local-only UI. Bound to loopback by default. Passwords never written to disk.</p>
+  </footer>
+</body>
+</html>

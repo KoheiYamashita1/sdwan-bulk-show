@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}Run · sdwan-bulk-show{% endblock %}
+{% block content %}
+  <h1>Run bulk-show via vManage</h1>
+  <p class="lede">
+    Submits the form, ssh-es to vManage, drops into <code>vshell</code>, and
+    fans out to every SD-WAN edge listed below using <code>bulk-show.py</code>.
+    Output files land under <code>logs/&lt;timestamp&gt;/</code>.
+  </p>
+
+  {% if error %}
+    <div class="alert alert--error" role="alert">
+      <strong>Cannot run:</strong> {{ error }}
+    </div>
+  {% endif %}
+
+  <form action="/run" method="post" class="form">
+    <fieldset class="form__group">
+      <legend>vManage connection</legend>
+      <label class="field">
+        <span>vManage host or IP</span>
+        <input type="text" name="vmanage_host" required
+               placeholder="vmanage.example.com"
+               value="{{ form.vmanage_host if form else '' }}">
+      </label>
+      <label class="field">
+        <span>SSH user</span>
+        <input type="text" name="user" required
+               placeholder="admin"
+               value="{{ form.user if form else '' }}">
+      </label>
+      <label class="field">
+        <span>SSH password (used for vManage <em>and</em> edges)</span>
+        <input type="password" name="password" required autocomplete="off">
+      </label>
+      <label class="field">
+        <span>Remote working dir on vManage</span>
+        <input type="text" name="remote_dir"
+               value="{{ form.remote_dir if form else default_remote_dir }}">
+      </label>
+    </fieldset>
+
+    <fieldset class="form__group">
+      <legend>Inventory &amp; commands</legend>
+      <label class="field">
+        <span>
+          host.txt&nbsp;
+          <small>One <code>IP,user,password</code> per line. Same password as above is fine.</small>
+        </span>
+        <textarea name="hosts_text" rows="6" required
+                  placeholder="192.168.1.1,admin,Cisco12345!&#10;192.168.1.2,admin,Cisco12345!">{{ form.hosts_text if form else '' }}</textarea>
+      </label>
+      <label class="field">
+        <span>
+          command.txt&nbsp;
+          <small>One CLI command per line. <code>show ip route</code> is a good warm-up.</small>
+        </span>
+        <textarea name="commands_text" rows="6" required
+                  placeholder="show ip route&#10;show omp route&#10;show ip int bri">{{ form.commands_text if form else '' }}</textarea>
+      </label>
+    </fieldset>
+
+    <fieldset class="form__group">
+      <legend>Options</legend>
+      <label class="check">
+        <input type="checkbox" name="download_outputs"
+               {% if form is none or form.download_outputs %}checked{% endif %}>
+        <span>Download <code>output_*.txt</code> back to <code>logs/&lt;timestamp&gt;/</code></span>
+      </label>
+      <label class="check">
+        <input type="checkbox" name="verbose"
+               {% if form and form.verbose %}checked{% endif %}>
+        <span>Verbose run_on_vmanage.py output</span>
+      </label>
+      <label class="check">
+        <input type="checkbox" name="reject_unknown_hosts"
+               {% if form and form.reject_unknown_hosts %}checked{% endif %}>
+        <span>Reject unknown vManage host keys (recommended after first run)</span>
+      </label>
+    </fieldset>
+
+    <div class="form__actions">
+      <button type="submit" class="button">Run</button>
+      <a href="/runs" class="button button--ghost">View past runs</a>
+    </div>
+  </form>
+{% endblock %}

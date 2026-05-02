@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}{{ timestamp }} · sdwan-bulk-show{% endblock %}
+{% block content %}
+  <p><a href="/runs">← Past runs</a></p>
+  <h1>Run <code>{{ timestamp }}</code></h1>
+
+  {% if error %}
+    <div class="alert alert--error" role="alert">
+      <strong>Error:</strong> {{ error }}
+    </div>
+  {% else %}
+    {% if run.manifest %}
+      {% set m = run.manifest %}
+      <section class="card">
+        <h2>Summary</h2>
+        <dl class="kv">
+          <dt>Status</dt>
+          <dd><span class="status status--{{ run.status }}">{{ run.status }}</span> (rc={{ m.returncode }})</dd>
+          <dt>vManage</dt>
+          <dd>{{ m.vmanage_host }} <small>(user: {{ m.vmanage_user }})</small></dd>
+          <dt>Remote dir</dt>
+          <dd><code>{{ m.remote_dir }}</code></dd>
+          <dt>Hosts × Commands</dt>
+          <dd>{{ m.hosts_count }} hosts × {{ m.commands_count }} commands</dd>
+          <dt>Started</dt>
+          <dd>{{ m.started_at }}</dd>
+          <dt>Ended</dt>
+          <dd>{{ m.ended_at }} <small>({{ "%.2f"|format(m.duration_sec) }} s)</small></dd>
+          <dt>Options</dt>
+          <dd>
+            download_outputs={{ m.options.download_outputs }},
+            verbose={{ m.options.verbose }},
+            reject_unknown_hosts={{ m.options.reject_unknown_hosts }}
+          </dd>
+          <dt>Output files</dt>
+          <dd>{{ m.outputs_count }}</dd>
+        </dl>
+      </section>
+    {% else %}
+      <div class="alert alert--info" role="alert">
+        No <code>manifest.json</code> for this run (likely created before the
+        Web UI shipped). The output files below were still scanned from disk.
+      </div>
+    {% endif %}
+
+    <section class="card">
+      <h2>Files</h2>
+      {% if files %}
+        <ul class="files">
+          {% for name in files %}
+            <li><a href="/runs/{{ timestamp }}/files/{{ name }}"><code>{{ name }}</code></a></li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="empty">No files captured for this run.</p>
+      {% endif %}
+    </section>
+  {% endif %}
+{% endblock %}

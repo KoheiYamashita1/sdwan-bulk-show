@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}{{ filename }} · {{ timestamp }} · sdwan-bulk-show{% endblock %}
+{% block content %}
+  <p><a href="/runs/{{ timestamp }}">← Run {{ timestamp }}</a></p>
+  <h1><code>{{ filename }}</code></h1>
+
+  {% if error %}
+    <div class="alert alert--error" role="alert">
+      <strong>Error:</strong> {{ error }}
+    </div>
+  {% else %}
+    {% if truncated %}
+      <div class="alert alert--info" role="alert">
+        File is large — showing the first {{ max_bytes }} bytes only.
+      </div>
+    {% endif %}
+    <pre class="filebox">{{ content }}</pre>
+  {% endif %}
+{% endblock %}
