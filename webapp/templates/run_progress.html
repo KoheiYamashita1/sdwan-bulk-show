@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block title %}Running… · sdwan-bulk-show{% endblock %}
+{% block content %}
+  <p><a href="/runs">← Past runs</a></p>
+  <h1>Run in progress</h1>
+
+  {% if job is none %}
+    <div class="alert alert--error" role="alert">
+      <strong>Unknown job.</strong> No active run with id
+      <code>{{ job_id }}</code> was found (the server may have restarted).
+      See <a href="/runs">past runs</a> for completed results.
+    </div>
+  {% else %}
+    <noscript>
+      <div class="alert alert--info" role="alert">
+        JavaScript is disabled, so this page can't update live. Open
+        <a href="/runs">past runs</a> and refresh until your run appears.
+      </div>
+    </noscript>
+
+    <section class="card">
+      <div class="progress" id="progress-wrap" data-status="{{ job.status }}">
+        <div class="progress__head">
+          <span class="progress__phase" id="phase">{{ job.phase }}</span>
+          <span class="progress__percent" id="percent">{{ job.percent }}%</span>
+        </div>
+        <progress class="progress__bar" id="bar" max="100"
+                  value="{{ job.percent }}">{{ job.percent }}%</progress>
+        <div class="progress__meta">
+          <span>status: <span class="status status--{{ job.status }}" id="status">{{ job.status }}</span></span>
+          <span id="counters">commands {{ job.commands_done }} / {{ job.commands_total }}</span>
+        </div>
+        <p class="progress__message" id="message">{{ job.message }}</p>
+      </div>
+
+      <div id="result" class="progress__result" hidden>
+        <a href="#" id="result-link" class="button">View full results</a>
+        <span id="result-note" class="progress__note"></span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Live log <small class="progress__note">(last {{ job.log_tail|length }} lines, password masked)</small></h2>
+      <pre class="filebox" id="log-tail">{% for line in job.log_tail %}{{ line }}
+{% endfor %}</pre>
+    </section>
+  {% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if job is not none %}
+<script>
+  // Poll the JSON progress endpoint and reflect it in the DOM. We only ever
+  // touch textContent / element.value (never innerHTML) so masked log lines
+  // cannot inject markup.
+  (function () {
+    "use strict";
+
+    var JOB_ID = {{ job_id | tojson }};
+    var POLL_MS = 1000;
+
+    var bar = document.getElementById("bar");
+    var percentEl = document.getElementById("percent");
+    var phaseEl = document.getElementById("phase");
+    var statusEl = document.getElementById("status");
+    var countersEl = document.getElementById("counters");
+    var messageEl = document.getElementById("message");
+    var logEl = document.getElementById("log-tail");
+    var wrap = document.getElementById("progress-wrap");
+    var resultBox = document.getElementById("result");
+    var resultLink = document.getElementById("result-link");
+    var resultNote = document.getElementById("result-note");
+
+    function render(data) {
+      var pct = typeof data.percent === "number" ? data.percent : 0;
+      if (bar) {
+        bar.value = pct;
+      }
+      if (percentEl) {
+        percentEl.textContent = pct + "%";
+      }
+      if (phaseEl) {
+        phaseEl.textContent = data.phase || "";
+      }
+      if (statusEl) {
+        statusEl.textContent = data.status || "";
+        statusEl.className = "status status--" + (data.status || "unknown");
+      }
+      if (wrap) {
+        wrap.setAttribute("data-status", data.status || "running");
+      }
+      if (countersEl) {
+        countersEl.textContent =
+          "commands " + (data.commands_done || 0) + " / " + (data.commands_total || 0);
+      }
+      if (messageEl) {
+        messageEl.textContent = data.message || "";
+      }
+      if (logEl && Array.isArray(data.log_tail)) {
+        logEl.textContent = data.log_tail.join("\n");
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+    }
+
+    function finish(data) {
+      if (resultBox) {
+        resultBox.hidden = false;
+      }
+      if (resultLink && data.timestamp) {
+        resultLink.href = "/runs/" + data.timestamp;
+      } else if (resultLink) {
+        resultLink.href = "/runs";
+        resultLink.textContent = "Back to runs";
+      }
+      if (resultNote) {
+        if (data.status === "success") {
+          resultNote.textContent = "Finished — redirecting…";
+        } else if (data.error) {
+          resultNote.textContent = "Finished (" + data.status + "): " + data.error;
+        } else {
+          resultNote.textContent = "Finished (" + data.status + ").";
+        }
+      }
+      // Gentle auto-redirect on success so the user lands on full results.
+      if (data.status === "success" && data.timestamp) {
+        window.setTimeout(function () {
+          window.location.href = "/runs/" + data.timestamp;
+        }, 1500);
+      }
+    }
+
+    function poll() {
+      fetch("/api/progress/" + encodeURIComponent(JOB_ID), {
+        headers: { "Accept": "application/json" },
+        cache: "no-store",
+      })
+        .then(function (resp) {
+          if (!resp.ok) {
+            throw new Error("HTTP " + resp.status);
+          }
+          return resp.json();
+        })
+        .then(function (data) {
+          render(data);
+          if (data.status && data.status !== "running") {
+            finish(data);
+            return; // stop polling
+          }
+          window.setTimeout(poll, POLL_MS);
+        })
+        .catch(function () {
+          // Transient error (server busy / restart): back off and retry.
+          window.setTimeout(poll, POLL_MS * 2);
+        });
+    }
+
+    window.setTimeout(poll, POLL_MS);
+  })();
+</script>
+{% endif %}
+{% endblock %}

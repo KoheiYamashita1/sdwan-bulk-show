@@ -216,6 +216,43 @@ a:hover {
   color: var(--accent);
 }
 
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 1rem;
+  padding: 0.6rem 0.85rem;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.toolbar__label {
+  font-weight: 600;
+  font-size: 0.92rem;
+}
+
+.toolbar .button {
+  padding: 0.4rem 0.85rem;
+  font-size: 0.9rem;
+}
+
+.toolbar__check {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+}
+
+.toolbar__hint {
+  font-size: 0.85rem;
+  color: var(--ok);
+  margin-left: auto;
+}
+
+.toolbar__hint--error {
+  color: var(--danger);
+}
+
 .alert {
   padding: 0.75rem 1rem;
   border-radius: 6px;
@@ -279,6 +316,21 @@ a:hover {
   color: var(--danger);
 }
 
+.status--timeout {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.status--error {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.status--running {
+  background: var(--info-bg);
+  color: var(--info);
+}
+
 .status--unknown {
   background: var(--warn-bg);
   color: var(--warn);
@@ -333,4 +385,382 @@ a:hover {
   font-size: 0.85rem;
   line-height: 1.45;
   white-space: pre;
+}
+
+/* --- Live run progress -------------------------------------------------- */
+
+.progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.progress__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.progress__phase {
+  font-weight: 600;
+  font-size: 1.05rem;
+}
+
+.progress__percent {
+  font-variant-numeric: tabular-nums;
+  font-size: 1.6rem;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.progress__bar {
+  width: 100%;
+  height: 1.1rem;
+  appearance: none;
+  -webkit-appearance: none;
+  border: none;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+/* WebKit (Safari/Chrome) progress fill + track. */
+.progress__bar::-webkit-progress-bar {
+  background: var(--border);
+  border-radius: 999px;
+}
+
+.progress__bar::-webkit-progress-value {
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+
+/* Firefox progress fill. */
+.progress__bar::-moz-progress-bar {
+  background: var(--accent);
+  border-radius: 999px;
+}
+
+/* Tint the bar green/red once the run reaches a terminal state. */
+.progress[data-status="success"] .progress__bar::-webkit-progress-value {
+  background: var(--ok);
+}
+.progress[data-status="success"] .progress__bar::-moz-progress-bar {
+  background: var(--ok);
+}
+.progress[data-status="failed"] .progress__bar::-webkit-progress-value,
+.progress[data-status="timeout"] .progress__bar::-webkit-progress-value,
+.progress[data-status="error"] .progress__bar::-webkit-progress-value {
+  background: var(--danger);
+}
+.progress[data-status="failed"] .progress__bar::-moz-progress-bar,
+.progress[data-status="timeout"] .progress__bar::-moz-progress-bar,
+.progress[data-status="error"] .progress__bar::-moz-progress-bar {
+  background: var(--danger);
+}
+
+.progress__meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  font-size: 0.9rem;
+  color: var(--fg-muted);
+}
+
+.progress__message {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-word;
+}
+
+.progress__result {
+  margin-top: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.progress__note {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+}
+
+#log-tail {
+  max-height: 24rem;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
+
+.progress__sub {
+  margin-top: 1.25rem;
+}
+
+/* --- Split command boxes ------------------------------------------------ */
+
+.field__note {
+  margin: 0 0 0.25rem;
+  color: var(--fg-muted);
+  font-size: 0.85rem;
+}
+
+.cmd-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 0.85rem;
+}
+
+/* --- Results / open-folder actions -------------------------------------- */
+
+.results__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 1rem;
+}
+
+/* --- Compare grid of panes ---------------------------------------------- */
+
+.compare__controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 1rem;
+}
+
+.compare__filter {
+  flex: 1 1 16rem;
+  font-family: inherit;
+  font-size: 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.45rem 0.65rem;
+  background: #fff;
+  color: var(--fg);
+}
+
+.compare__filter:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.compare__cols {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+}
+
+.compare__cols .button {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.85rem;
+}
+
+.compare__grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.compare__grid[data-cols="1"] {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.compare__grid[data-cols="2"] {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.compare__grid[data-cols="3"] {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+@media (max-width: 720px) {
+  .compare__grid,
+  .compare__grid[data-cols="2"],
+  .compare__grid[data-cols="3"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--card);
+}
+
+.pane__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.35rem 0.6rem;
+  background: #f1f5f9;
+  border-bottom: 1px solid var(--border);
+}
+
+.pane__name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.pane__open {
+  font-size: 0.78rem;
+  text-decoration: none;
+}
+
+.pane__body {
+  margin: 0;
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.6rem 0.7rem;
+  min-height: 10rem;
+  max-height: 22rem;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  white-space: pre;
+}
+
+/* --- Pick-two-and-diff file list ---------------------------------------- */
+
+.filediff {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.filelist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.filelist__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+}
+
+.filelist__label {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex: 1 1 auto;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.filelist__check {
+  flex: 0 0 auto;
+}
+
+.filelist__name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  word-break: break-all;
+}
+
+.filelist__open {
+  flex: 0 0 auto;
+  padding: 0.25rem 0.7rem;
+  font-size: 0.82rem;
+}
+
+.filediff__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.filediff__hint {
+  margin-left: 0;
+}
+
+.filediff__panel {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.filediff__header {
+  padding: 0.4rem 0.7rem;
+  background: #f1f5f9;
+  border-bottom: 1px solid var(--border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.filediff__body {
+  margin: 0;
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.6rem 0.7rem;
+  max-height: 28rem;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  white-space: pre;
+}
+
+.diffline {
+  display: block;
+}
+
+.diffline--add {
+  color: #4ade80;
+}
+
+.diffline--del {
+  color: #f87171;
+}
+
+.diffline--ctx {
+  color: var(--code-fg);
+  opacity: 0.6;
+}
+
+.diffline--hunk {
+  color: #93c5fd;
+  font-weight: 700;
+}
+
+.files-all {
+  margin-bottom: 1rem;
+  color: var(--fg-muted);
+  font-size: 0.9rem;
+}
+
+.files-all summary {
+  cursor: pointer;
+}
+
+.files-all .files {
+  margin-top: 0.5rem;
 }

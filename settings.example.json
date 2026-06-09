@@ -1,0 +1,11 @@
+{
+  "vmanage_host": "vmanage.example.com",
+  "user": "admin",
+  "remote_dir": "/home/admin",
+  "hosts_text": "1.1.1.2,admin,type=controller\n1.1.1.1,admin,type=controller\n2.1.1.1,admin",
+  "controller_commands_text": "show running-config system\nshow control connections",
+  "edge_commands_text": "show sdwan control connections\nshow ip route",
+  "download_outputs": true,
+  "verbose": false,
+  "reject_unknown_hosts": false
+}

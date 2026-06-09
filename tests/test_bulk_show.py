@@ -316,6 +316,47 @@ class ParseHostLineTests(unittest.TestCase):
         )
 
 
+class ResolveCommandsFileTests(unittest.TestCase):
+    def test_controller_prefers_controller_file(self) -> None:
+        self.assertEqual(
+            bulk_show.resolve_commands_file(
+                bulk_show.DEVICE_CONTROLLER, "base.txt", "ctrl.txt", "edge.txt"
+            ),
+            "ctrl.txt",
+        )
+
+    def test_edge_prefers_edge_file(self) -> None:
+        self.assertEqual(
+            bulk_show.resolve_commands_file(
+                bulk_show.DEVICE_EDGE, "base.txt", "ctrl.txt", "edge.txt"
+            ),
+            "edge.txt",
+        )
+
+    def test_controller_falls_back_to_base(self) -> None:
+        self.assertEqual(
+            bulk_show.resolve_commands_file(
+                bulk_show.DEVICE_CONTROLLER, "base.txt", None, "edge.txt"
+            ),
+            "base.txt",
+        )
+
+    def test_edge_falls_back_to_base(self) -> None:
+        self.assertEqual(
+            bulk_show.resolve_commands_file(
+                bulk_show.DEVICE_EDGE, "base.txt", "ctrl.txt", None
+            ),
+            "base.txt",
+        )
+
+    def test_returns_none_when_no_file_available(self) -> None:
+        self.assertIsNone(
+            bulk_show.resolve_commands_file(
+                bulk_show.DEVICE_CONTROLLER, None, None, None
+            )
+        )
+
+
 class ControllerConnectTests(unittest.TestCase):
     """Finding 2: a controller that re-prompts for a password must fail loudly
     instead of silently succeeding with show commands sent into the prompt."""

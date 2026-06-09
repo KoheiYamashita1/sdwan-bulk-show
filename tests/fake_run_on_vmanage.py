@@ -58,6 +58,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--local-dir", required=True)
     parser.add_argument("--hosts", default="host.txt")
     parser.add_argument("--commands", default="command.txt")
+    parser.add_argument("--controller-commands", default=None)
+    parser.add_argument("--edge-commands", default=None)
     parser.add_argument("--bulk-script", default="bulk-show.py")
     parser.add_argument("--download-outputs", action="store_true")
     parser.add_argument("--verbose", action="store_true")

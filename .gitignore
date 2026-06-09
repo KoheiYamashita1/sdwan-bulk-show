@@ -4,6 +4,9 @@ output_*.json
 output_*.csv
 host.txt
 command.txt
+# Environment-specific web UI settings (may list internal IPs / credentials)
+settings.local.json
+settings.*.local.json
 __pycache__/
 *.pyc
 

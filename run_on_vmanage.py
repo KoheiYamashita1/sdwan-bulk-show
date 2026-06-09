@@ -86,7 +86,23 @@ def parse_args():
     parser.add_argument(
         "--commands",
         default="commands.txt",
-        help="Commands file name inside local dir (default: commands.txt)",
+        help="Default/fallback commands file name inside local dir "
+             "(default: commands.txt). Applied to any device type without a "
+             "more specific list below.",
+    )
+    parser.add_argument(
+        "--controller-commands",
+        default=None,
+        help="Optional commands file name inside local dir applied only to "
+             "controller hosts (vBond/vSmart/vEdge). Uploaded and forwarded "
+             "to bulk-show.py as --controller-commands.",
+    )
+    parser.add_argument(
+        "--edge-commands",
+        default=None,
+        help="Optional commands file name inside local dir applied only to "
+             "edge hosts (cEdge/IOS-XE). Uploaded and forwarded to "
+             "bulk-show.py as --edge-commands.",
     )
     parser.add_argument(
         "--bulk-script",
@@ -204,8 +220,18 @@ def main():
     bulk_script = local_dir / args.bulk_script
     hosts_file = local_dir / args.hosts
     commands_file = local_dir / args.commands
+    controller_commands_file = (
+        local_dir / args.controller_commands if args.controller_commands else None
+    )
+    edge_commands_file = (
+        local_dir / args.edge_commands if args.edge_commands else None
+    )
 
-    for path in (bulk_script, hosts_file, commands_file):
+    required_files = [bulk_script, hosts_file, commands_file]
+    for path in (controller_commands_file, edge_commands_file):
+        if path is not None:
+            required_files.append(path)
+    for path in required_files:
         if not path.exists():
             log(f"Missing local file: {path}")
             sys.exit(1)
@@ -274,6 +300,16 @@ def main():
         sftp.put(str(bulk_script), remote_bulk)
         sftp.put(str(hosts_file), remote_hosts)
         sftp.put(str(commands_file), remote_commands)
+        if controller_commands_file is not None:
+            sftp.put(
+                str(controller_commands_file),
+                f"{remote_dir}/{controller_commands_file.name}",
+            )
+        if edge_commands_file is not None:
+            sftp.put(
+                str(edge_commands_file),
+                f"{remote_dir}/{edge_commands_file.name}",
+            )
     finally:
         sftp.close()
 
@@ -283,6 +319,12 @@ def main():
         f"{remote_dir}/{hosts_file.name} {remote_dir}/{commands_file.name} "
         f"--logs-dir {remote_logs_dir}"
     )
+    if controller_commands_file is not None:
+        remote_cmd += (
+            f" --controller-commands {remote_dir}/{controller_commands_file.name}"
+        )
+    if edge_commands_file is not None:
+        remote_cmd += f" --edge-commands {remote_dir}/{edge_commands_file.name}"
     if not args.quiet:
         log(f"[{args.vmanage_host}] running via vshell session")
     shell = ssh.invoke_shell()

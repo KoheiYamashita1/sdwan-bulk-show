@@ -20,11 +20,13 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Form, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -82,7 +84,7 @@ def index(request: Request) -> HTMLResponse:
     )
 
 
-@app.post("/run", response_class=HTMLResponse)
+@app.post("/run")
 def submit_run(
     request: Request,
     vmanage_host: str = Form(...),
@@ -91,14 +93,23 @@ def submit_run(
     remote_dir: str = Form(DEFAULT_REMOTE_DIR),
     hosts_text: str = Form(""),
     commands_text: str = Form(""),
+    controller_commands_text: str = Form(""),
+    edge_commands_text: str = Form(""),
     download_outputs: Optional[str] = Form(None),
     verbose: Optional[str] = Form(None),
     reject_unknown_hosts: Optional[str] = Form(None),
 ):
-    """Receive the form, spawn ``run_on_vmanage.py``, redirect to detail page.
+    """Receive the form and kick off ``run_on_vmanage.py`` asynchronously.
 
-    On any validation or busy/timeout error we re-render the index with the
-    submitted values (minus the password) so the user can fix and retry.
+    Two response shapes:
+
+    * **AJAX** (``X-Requested-With: XMLHttpRequest`` or an ``application/json``
+      Accept header): return JSON ``{"job_id": "..."}`` (200) on success, or
+      ``{"error": "..."}`` with 400/409/500 on failure. The index page renders
+      progress and results inline without navigating away.
+    * **Plain form POST** (no-JS fallback): 303-redirect to the standalone
+      ``/runs/active/{job_id}`` progress page, or re-render the index with the
+      submitted (non-secret) values on error.
     """
 
     form = runner.RunForm(
@@ -108,31 +119,66 @@ def submit_run(
         remote_dir=remote_dir.strip() or DEFAULT_REMOTE_DIR,
         hosts_text=hosts_text,
         commands_text=commands_text,
+        controller_commands_text=controller_commands_text,
+        edge_commands_text=edge_commands_text,
         download_outputs=_checkbox(download_outputs),
         verbose=_checkbox(verbose),
         reject_unknown_hosts=_checkbox(reject_unknown_hosts),
     )
 
+    wants_json = _wants_json(request)
     try:
-        result = runner.run_via_vmanage(form)
+        job_id = runner.start_run_async(form)
     except runner.RunInputError as exc:
-        return _render_index_error(request, form, str(exc), status.HTTP_400_BAD_REQUEST)
+        return _run_error(request, form, str(exc), status.HTTP_400_BAD_REQUEST, wants_json)
     except runner.RunBusyError as exc:
-        return _render_index_error(request, form, str(exc), status.HTTP_409_CONFLICT)
+        return _run_error(request, form, str(exc), status.HTTP_409_CONFLICT, wants_json)
     except Exception as exc:  # noqa: BLE001 — we genuinely want the wide net
-        logger.exception("run_via_vmanage crashed")
-        return _render_index_error(
+        logger.exception("start_run_async crashed")
+        return _run_error(
             request,
             form,
-            f"Unexpected error while running run_on_vmanage.py: {exc}",
+            f"Unexpected error while starting run_on_vmanage.py: {exc}",
             status.HTTP_500_INTERNAL_SERVER_ERROR,
+            wants_json,
         )
 
-    # 303 sends the browser to GET the detail page so a refresh doesn't
+    if wants_json:
+        return JSONResponse({"job_id": job_id})
+    # 303 sends the browser to GET the progress page so a refresh doesn't
     # accidentally re-submit (POST/Redirect/GET pattern).
     return RedirectResponse(
-        url=f"/runs/{result.timestamp}", status_code=status.HTTP_303_SEE_OTHER
+        url=f"/runs/active/{job_id}", status_code=status.HTTP_303_SEE_OTHER
     )
+
+
+@app.get("/runs/active/{job_id}", response_class=HTMLResponse)
+def run_progress(request: Request, job_id: str) -> HTMLResponse:
+    """Live progress page for an in-flight (or just-finished) async run."""
+
+    snapshot = runner.job_snapshot(job_id)
+    status_code = status.HTTP_200_OK if snapshot else status.HTTP_404_NOT_FOUND
+    return templates.TemplateResponse(
+        request,
+        "run_progress.html",
+        {
+            "job_id": job_id,
+            "job": snapshot,
+        },
+        status_code=status_code,
+    )
+
+
+@app.get("/api/progress/{job_id}")
+def api_progress(job_id: str) -> JSONResponse:
+    """Polling endpoint: the :class:`RunJob` snapshot as JSON (masked only)."""
+
+    snapshot = runner.job_snapshot(job_id)
+    if snapshot is None:
+        return JSONResponse(
+            {"error": "unknown job_id"}, status_code=status.HTTP_404_NOT_FOUND
+        )
+    return JSONResponse(snapshot)
 
 
 @app.get("/runs", response_class=HTMLResponse)
@@ -162,11 +208,13 @@ def run_detail(request: Request, timestamp: str) -> HTMLResponse:
                 "timestamp": timestamp,
                 "run": None,
                 "files": [],
+                "output_files": [],
                 "error": str(exc),
             },
             status_code=status.HTTP_404_NOT_FOUND,
         )
 
+    output_files = [name for name in files if name.startswith("output_")]
     return templates.TemplateResponse(
         request,
         "run_detail.html",
@@ -174,6 +222,7 @@ def run_detail(request: Request, timestamp: str) -> HTMLResponse:
             "timestamp": timestamp,
             "run": run,
             "files": files,
+            "output_files": output_files,
             "error": None,
         },
     )
@@ -214,6 +263,152 @@ def view_file(request: Request, timestamp: str, filename: str) -> HTMLResponse:
     )
 
 
+@app.get("/api/runs/{timestamp}/file")
+def api_run_file(timestamp: str, name: str) -> JSONResponse:
+    """Raw file content as JSON for the compare panes.
+
+    ``{"name": ..., "content": <text>, "truncated": <bool>}`` on success;
+    404 ``{"error": ...}`` for an unknown/invalid run or filename. Path safety
+    is delegated to :func:`storage.read_file_text`.
+    """
+
+    try:
+        text, truncated = storage.read_file_text(timestamp, name)
+    except storage.StorageError as exc:
+        return JSONResponse(
+            {"error": str(exc)}, status_code=status.HTTP_404_NOT_FOUND
+        )
+    return JSONResponse({"name": name, "content": text, "truncated": truncated})
+
+
+@app.get("/api/runs/{timestamp}/diff")
+def api_run_diff(timestamp: str, a: str, b: str) -> JSONResponse:
+    """Unified diff of two files in a run as JSON.
+
+    Both ``a`` and ``b`` are resolved through :func:`storage.diff_files`,
+    which reads each file via the same safe path mechanism as
+    :func:`storage.read_file_text` (path-traversal safe, ``MAX_VIEW_BYTES``
+    bounded). Returns ``404`` if either file is missing or unsafe. The shape
+    is ``{"a", "b", "a_truncated", "b_truncated", "diff": [...], "identical"}``
+    where ``diff`` is a list of plain-text unified-diff lines the client
+    colourises by leading character.
+    """
+
+    try:
+        payload = storage.diff_files(timestamp, a, b)
+    except storage.StorageError as exc:
+        return JSONResponse(
+            {"error": str(exc)}, status_code=status.HTTP_404_NOT_FOUND
+        )
+    return JSONResponse(payload)
+
+
+@app.get("/runs/{timestamp}/compare", response_class=HTMLResponse)
+def run_compare(request: Request, timestamp: str) -> HTMLResponse:
+    """Pick-two-and-diff view over a run's ``output_*`` files."""
+
+    try:
+        run = storage.get_run(timestamp)
+        files = storage.list_run_files(timestamp)
+    except storage.StorageError as exc:
+        return templates.TemplateResponse(
+            request,
+            "run_compare.html",
+            {
+                "timestamp": timestamp,
+                "run": None,
+                "files": [],
+                "error": str(exc),
+            },
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    output_files = [name for name in files if name.startswith("output_")]
+    return templates.TemplateResponse(
+        request,
+        "run_compare.html",
+        {
+            "timestamp": timestamp,
+            "run": run,
+            "files": output_files,
+            "error": None,
+        },
+    )
+
+
+@app.post("/runs/{timestamp}/open")
+async def open_run_dir(request: Request, timestamp: str) -> JSONResponse:
+    """Open a run's log folder — or a single file in it — locally (macOS only).
+
+    Two modes, both driven off server-resolved absolute paths only:
+
+    * **Folder** (no ``name`` field): ``target`` selects Finder (``open <dir>``)
+      or Terminal (``open -a Terminal <dir>``). The directory is resolved via
+      :func:`storage.safe_run_dir`.
+    * **Single file** (``name`` present): the file is resolved via
+      :func:`storage.safe_file_path` (same path-safety as ``read_file_text``)
+      and opened in its default app with ``open <file>``.
+
+    Security: the timestamp shape and every path are validated before any
+    spawn, and only the server-resolved absolute path is ever handed to
+    ``subprocess.run`` as an argv list — never a shell string. The actual
+    spawn is gated behind ``sys.platform == "darwin"``; path-validation errors
+    (404/400) are returned regardless of platform.
+    """
+
+    target, name = await _extract_open_fields(request)
+
+    # Resolve (and thereby validate) the run dir first so a bad timestamp is a
+    # 404 on every platform, before we even consider spawning anything.
+    try:
+        run_dir = storage.safe_run_dir(timestamp)
+    except storage.StorageError as exc:
+        return JSONResponse(
+            {"error": str(exc)}, status_code=status.HTTP_404_NOT_FOUND
+        )
+
+    if name:
+        # Per-file open: resolve through the same safe mechanism as the
+        # readers so traversal / symlinks are refused (404) before any spawn.
+        try:
+            file_path = storage.safe_file_path(timestamp, name)
+        except storage.StorageError as exc:
+            return JSONResponse(
+                {"error": str(exc)}, status_code=status.HTTP_404_NOT_FOUND
+            )
+        argv = ["open", str(file_path)]
+        what = f"file {name}"
+    else:
+        if target not in {"finder", "terminal"}:
+            return JSONResponse(
+                {"error": "target must be 'finder' or 'terminal'."},
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        if target == "finder":
+            argv = ["open", str(run_dir)]
+        else:
+            argv = ["open", "-a", "Terminal", str(run_dir)]
+        what = "folder"
+
+    if sys.platform != "darwin":
+        return JSONResponse(
+            {"error": "Opening is only supported on macOS."},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        subprocess.run(
+            argv, check=False, capture_output=True, timeout=10, shell=False
+        )
+    except Exception as exc:  # noqa: BLE001 — surface any spawn failure as JSON
+        logger.exception("failed to open %s for run %s", what, timestamp)
+        return JSONResponse(
+            {"error": f"could not open {what}: {exc}"},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+    return JSONResponse({"ok": True})
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -229,6 +424,63 @@ def _checkbox(value: Optional[str]) -> bool:
     if value is None:
         return False
     return value.lower() in {"on", "true", "1", "yes"}
+
+
+def _wants_json(request: Request) -> bool:
+    """True when the client expects a JSON response (the inline-UI fetch path)."""
+
+    if request.headers.get("x-requested-with", "").lower() == "xmlhttprequest":
+        return True
+    return "application/json" in request.headers.get("accept", "").lower()
+
+
+async def _extract_open_fields(
+    request: Request,
+) -> tuple[Optional[str], Optional[str]]:
+    """Read ``(target, name)`` from a JSON or form-encoded request body.
+
+    ``target`` selects the folder open mode (Finder/Terminal); ``name``, when
+    present, switches to single-file open. Either may be ``None``/absent.
+    """
+
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type.lower():
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - malformed JSON -> nothing
+            return None, None
+        if not isinstance(body, dict):
+            return None, None
+        target = body.get("target")
+        name = body.get("name")
+        return (
+            target if isinstance(target, str) else None,
+            name if isinstance(name, str) else None,
+        )
+    try:
+        form = await request.form()
+    except Exception:  # noqa: BLE001 - malformed body -> nothing
+        return None, None
+    target = form.get("target")
+    name = form.get("name")
+    return (
+        target if isinstance(target, str) else None,
+        name if isinstance(name, str) else None,
+    )
+
+
+def _run_error(
+    request: Request,
+    form: runner.RunForm,
+    error: str,
+    status_code: int,
+    wants_json: bool,
+):
+    """Return a JSON error (AJAX) or re-rendered index (no-JS) for /run."""
+
+    if wants_json:
+        return JSONResponse({"error": error}, status_code=status_code)
+    return _render_index_error(request, form, error, status_code)
 
 
 def _render_index_error(
@@ -250,6 +502,8 @@ def _render_index_error(
                 "remote_dir": form.remote_dir,
                 "hosts_text": form.hosts_text,
                 "commands_text": form.commands_text,
+                "controller_commands_text": form.controller_commands_text,
+                "edge_commands_text": form.edge_commands_text,
                 "download_outputs": form.download_outputs,
                 "verbose": form.verbose,
                 "reject_unknown_hosts": form.reject_unknown_hosts,

@@ -4,17 +4,30 @@
   <h1>Run bulk-show via vManage</h1>
   <p class="lede">
     Submits the form, ssh-es to vManage, drops into <code>vshell</code>, and
-    fans out to every SD-WAN edge listed below using <code>bulk-show.py</code>.
-    Output files land under <code>logs/&lt;timestamp&gt;/</code>.
+    fans out to every SD-WAN device listed below using <code>bulk-show.py</code>.
+    Controllers and edges each run their own command list. Output files land
+    under <code>logs/&lt;timestamp&gt;/</code>.
   </p>
 
   {% if error %}
-    <div class="alert alert--error" role="alert">
+    <div class="alert alert--error" role="alert" id="form-error">
       <strong>Cannot run:</strong> {{ error }}
     </div>
   {% endif %}
 
-  <form action="/run" method="post" class="form">
+  <div class="toolbar" id="settings-toolbar">
+    <span class="toolbar__label">Settings:</span>
+    <label class="button button--ghost" for="settings-import-input">Import JSON</label>
+    <input type="file" id="settings-import-input" accept=".json,application/json" hidden>
+    <button type="button" class="button button--ghost" id="settings-export-btn">Export JSON</button>
+    <label class="check toolbar__check">
+      <input type="checkbox" id="settings-export-password">
+      <span>Include password in export (insecure)</span>
+    </label>
+    <span class="toolbar__hint" id="settings-status" role="status" aria-live="polite"></span>
+  </div>
+
+  <form action="/run" method="post" class="form" id="run-form">
     <fieldset class="form__group">
       <legend>vManage connection</legend>
       <label class="field">
@@ -41,23 +54,41 @@
     </fieldset>
 
     <fieldset class="form__group">
-      <legend>Inventory &amp; commands</legend>
+      <legend>Inventory</legend>
       <label class="field">
         <span>
           host.txt&nbsp;
-          <small>One <code>IP,user,password</code> per line. Same password as above is fine.</small>
+          <small>One <code>IP,user</code> per line; password optional (the field above is reused if omitted). Mark controllers with <code>,type=controller</code> (vBond/vSmart/vEdge).</small>
         </span>
         <textarea name="hosts_text" rows="6" required
-                  placeholder="192.168.1.1,admin,Cisco12345!&#10;192.168.1.2,admin,Cisco12345!">{{ form.hosts_text if form else '' }}</textarea>
+                  placeholder="192.168.1.1,admin,type=controller&#10;192.168.1.2,admin">{{ form.hosts_text if form else '' }}</textarea>
       </label>
-      <label class="field">
-        <span>
-          command.txt&nbsp;
-          <small>One CLI command per line. <code>show ip route</code> is a good warm-up.</small>
-        </span>
-        <textarea name="commands_text" rows="6" required
-                  placeholder="show ip route&#10;show omp route&#10;show ip int bri">{{ form.commands_text if form else '' }}</textarea>
-      </label>
+    </fieldset>
+
+    <fieldset class="form__group">
+      <legend>Commands</legend>
+      <p class="field__note">
+        Each host runs the list matching its device type. Leave one box empty
+        to reuse the other for both types.
+      </p>
+      <div class="cmd-grid">
+        <label class="field">
+          <span>
+            Controller commands&nbsp;
+            <small>vBond / vSmart / vEdge (viptela CLI).</small>
+          </span>
+          <textarea name="controller_commands_text" rows="6"
+                    placeholder="show control connections&#10;show omp peers">{{ form.controller_commands_text if form else '' }}</textarea>
+        </label>
+        <label class="field">
+          <span>
+            Edge commands&nbsp;
+            <small>cEdge / IOS-XE.</small>
+          </span>
+          <textarea name="edge_commands_text" rows="6"
+                    placeholder="show ip route&#10;show sdwan omp peers">{{ form.edge_commands_text if form else '' }}</textarea>
+        </label>
+      </div>
     </fieldset>
 
     <fieldset class="form__group">
@@ -80,8 +111,499 @@
     </fieldset>
 
     <div class="form__actions">
-      <button type="submit" class="button">Run</button>
+      <button type="submit" class="button" id="run-button">Run</button>
       <a href="/runs" class="button button--ghost">View past runs</a>
     </div>
   </form>
+
+  <section class="card" id="progress" hidden>
+    <h2>Progress</h2>
+    <div class="progress" id="progress-wrap" data-status="running">
+      <div class="progress__head">
+        <span class="progress__phase" id="phase">Starting</span>
+        <span class="progress__percent" id="percent">0%</span>
+      </div>
+      <progress class="progress__bar" id="bar" max="100" value="0">0%</progress>
+      <div class="progress__meta">
+        <span>status: <span class="status status--running" id="status">running</span></span>
+        <span id="counters">commands 0 / 0</span>
+      </div>
+      <p class="progress__message" id="message"></p>
+    </div>
+
+    <h2 class="progress__sub">Live log <small class="progress__note">(password masked)</small></h2>
+    <pre class="filebox" id="log-tail"></pre>
+  </section>
+
+  <section class="card" id="results" hidden>
+    <h2>Results</h2>
+    <p id="results-summary" class="progress__note"></p>
+    <div class="results__actions" id="results-actions">
+      <a href="#" id="results-detail-link" class="button button--ghost">Open run detail</a>
+      <a href="#" id="results-compare-link" class="button button--ghost">Full compare view</a>
+      <button type="button" class="button button--ghost" id="open-finder-btn">Reveal in Finder</button>
+      <button type="button" class="button button--ghost" id="open-terminal-btn">Open in Terminal</button>
+      <span class="toolbar__hint" id="open-status" role="status" aria-live="polite"></span>
+    </div>
+
+    <p class="progress__note">Pick two output files, then press <strong>Diff</strong>.</p>
+    <div class="filediff" id="results-filediff"></div>
+  </section>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/filediff.js"></script>
+<script>
+  // Client-side settings import/export. Everything happens in the browser:
+  // the JSON file is read locally and the form is prefilled, so no settings
+  // (and, by default, no password) are ever sent to or stored on the server.
+  (function () {
+    "use strict";
+
+    // Text fields and textareas share the same value handling; checkboxes are
+    // handled via the "checks" list. The two command boxes replaced the old
+    // single ``commands_text`` field, but legacy imports are still honoured.
+    var TEXT_KEYS = [
+      "vmanage_host",
+      "user",
+      "remote_dir",
+      "hosts_text",
+      "controller_commands_text",
+      "edge_commands_text",
+    ];
+    var CHECK_KEYS = ["download_outputs", "verbose", "reject_unknown_hosts"];
+    var PASSWORD_KEY = "password";
+    var LEGACY_COMMANDS_KEY = "commands_text";
+
+    var form = document.getElementById("run-form");
+    var importInput = document.getElementById("settings-import-input");
+    var exportBtn = document.getElementById("settings-export-btn");
+    var exportPwToggle = document.getElementById("settings-export-password");
+    var status = document.getElementById("settings-status");
+
+    if (!form) {
+      return;
+    }
+
+    function setStatus(message, isError) {
+      if (!status) {
+        return;
+      }
+      status.textContent = message || "";
+      status.classList.toggle("toolbar__hint--error", Boolean(isError));
+    }
+
+    function field(name) {
+      return form.elements.namedItem(name);
+    }
+
+    function applySettings(data) {
+      if (data === null || typeof data !== "object" || Array.isArray(data)) {
+        throw new Error("JSON must be an object of settings.");
+      }
+      var applied = 0;
+      TEXT_KEYS.forEach(function (key) {
+        if (Object.prototype.hasOwnProperty.call(data, key)) {
+          var el = field(key);
+          if (el) {
+            el.value = data[key] == null ? "" : String(data[key]);
+            applied += 1;
+          }
+        }
+      });
+      // Legacy compatibility: a file with the old single ``commands_text`` key
+      // (and neither new key) seeds BOTH command boxes.
+      var hasController = Object.prototype.hasOwnProperty.call(
+        data, "controller_commands_text"
+      );
+      var hasEdge = Object.prototype.hasOwnProperty.call(
+        data, "edge_commands_text"
+      );
+      if (
+        Object.prototype.hasOwnProperty.call(data, LEGACY_COMMANDS_KEY) &&
+        !hasController &&
+        !hasEdge
+      ) {
+        var legacy = data[LEGACY_COMMANDS_KEY] == null
+          ? ""
+          : String(data[LEGACY_COMMANDS_KEY]);
+        var ctrl = field("controller_commands_text");
+        var edge = field("edge_commands_text");
+        if (ctrl) {
+          ctrl.value = legacy;
+          applied += 1;
+        }
+        if (edge) {
+          edge.value = legacy;
+          applied += 1;
+        }
+      }
+      CHECK_KEYS.forEach(function (key) {
+        if (Object.prototype.hasOwnProperty.call(data, key)) {
+          var el = field(key);
+          if (el) {
+            el.checked = Boolean(data[key]);
+            applied += 1;
+          }
+        }
+      });
+      // Password is applied only when explicitly present in the file. Storing
+      // it in JSON is the user's choice; we never require or export it
+      // silently.
+      if (Object.prototype.hasOwnProperty.call(data, PASSWORD_KEY)) {
+        var pw = field(PASSWORD_KEY);
+        if (pw) {
+          pw.value = data[PASSWORD_KEY] == null ? "" : String(data[PASSWORD_KEY]);
+          applied += 1;
+        }
+      }
+      return applied;
+    }
+
+    function collectSettings(includePassword) {
+      var out = {};
+      TEXT_KEYS.forEach(function (key) {
+        var el = field(key);
+        out[key] = el ? el.value : "";
+      });
+      CHECK_KEYS.forEach(function (key) {
+        var el = field(key);
+        out[key] = el ? el.checked : false;
+      });
+      if (includePassword) {
+        var pw = field(PASSWORD_KEY);
+        out[PASSWORD_KEY] = pw ? pw.value : "";
+      }
+      return out;
+    }
+
+    if (importInput) {
+      importInput.addEventListener("change", function () {
+        var file = importInput.files && importInput.files[0];
+        if (!file) {
+          return;
+        }
+        var reader = new FileReader();
+        reader.onload = function () {
+          try {
+            var data = JSON.parse(String(reader.result));
+            var count = applySettings(data);
+            setStatus(
+              "Imported " + count + " field(s) from " + file.name + ".",
+              false
+            );
+          } catch (err) {
+            setStatus("Import failed: " + err.message, true);
+          }
+          // Reset so selecting the same file again re-triggers change.
+          importInput.value = "";
+        };
+        reader.onerror = function () {
+          setStatus("Could not read the selected file.", true);
+          importInput.value = "";
+        };
+        reader.readAsText(file);
+      });
+    }
+
+    if (exportBtn) {
+      exportBtn.addEventListener("click", function () {
+        var includePassword = Boolean(
+          exportPwToggle && exportPwToggle.checked
+        );
+        var payload = collectSettings(includePassword);
+        var blob = new Blob([JSON.stringify(payload, null, 2) + "\n"], {
+          type: "application/json",
+        });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = "sdwan-bulk-show-settings.json";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        setStatus(
+          includePassword
+            ? "Exported settings (password INCLUDED)."
+            : "Exported settings (password excluded).",
+          false
+        );
+      });
+    }
+  })();
+
+  // Inline run flow: submit via fetch, poll progress, then render results
+  // (pick-two-and-diff file list + open-folder buttons) on the same page. We
+  // only ever use textContent / element.value (never innerHTML) so masked
+  // output cannot inject markup.
+  (function () {
+    "use strict";
+
+    var POLL_MS = 1000;
+
+    var form = document.getElementById("run-form");
+    if (!form) {
+      return;
+    }
+    var runButton = document.getElementById("run-button");
+    var formError = document.getElementById("form-error");
+
+    var progressSection = document.getElementById("progress");
+    var wrap = document.getElementById("progress-wrap");
+    var bar = document.getElementById("bar");
+    var percentEl = document.getElementById("percent");
+    var phaseEl = document.getElementById("phase");
+    var statusEl = document.getElementById("status");
+    var countersEl = document.getElementById("counters");
+    var messageEl = document.getElementById("message");
+    var logEl = document.getElementById("log-tail");
+
+    var resultsSection = document.getElementById("results");
+    var resultsSummary = document.getElementById("results-summary");
+    var detailLink = document.getElementById("results-detail-link");
+    var compareLink = document.getElementById("results-compare-link");
+    var finderBtn = document.getElementById("open-finder-btn");
+    var terminalBtn = document.getElementById("open-terminal-btn");
+    var openStatus = document.getElementById("open-status");
+    var fileDiffContainer = document.getElementById("results-filediff");
+
+    var currentTimestamp = null;
+
+    function setRunning(isRunning) {
+      if (runButton) {
+        runButton.disabled = isRunning;
+        runButton.textContent = isRunning ? "Running…" : "Run";
+      }
+    }
+
+    function showFormError(text) {
+      if (!formError) {
+        formError = document.createElement("div");
+        formError.className = "alert alert--error";
+        formError.setAttribute("role", "alert");
+        formError.id = "form-error";
+        form.parentNode.insertBefore(formError, form);
+      }
+      formError.textContent = "";
+      var strong = document.createElement("strong");
+      strong.textContent = "Cannot run: ";
+      formError.appendChild(strong);
+      formError.appendChild(document.createTextNode(text));
+      formError.hidden = false;
+    }
+
+    function clearFormError() {
+      if (formError) {
+        formError.hidden = true;
+      }
+    }
+
+    function render(data) {
+      var pct = typeof data.percent === "number" ? data.percent : 0;
+      if (bar) {
+        bar.value = pct;
+      }
+      if (percentEl) {
+        percentEl.textContent = pct + "%";
+      }
+      if (phaseEl) {
+        phaseEl.textContent = data.phase || "";
+      }
+      if (statusEl) {
+        statusEl.textContent = data.status || "";
+        statusEl.className = "status status--" + (data.status || "unknown");
+      }
+      if (wrap) {
+        wrap.setAttribute("data-status", data.status || "running");
+      }
+      if (countersEl) {
+        countersEl.textContent =
+          "commands " + (data.commands_done || 0) + " / " + (data.commands_total || 0);
+      }
+      if (messageEl) {
+        messageEl.textContent = data.message || "";
+      }
+      if (logEl && Array.isArray(data.log_tail)) {
+        logEl.textContent = data.log_tail.join("\n");
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+    }
+
+    function renderFileDiff(outputs) {
+      if (!fileDiffContainer || !window.FileDiff) {
+        return;
+      }
+      window.FileDiff.init({
+        container: fileDiffContainer,
+        timestamp: currentTimestamp,
+        files: Array.isArray(outputs) ? outputs : [],
+      });
+    }
+
+    function finish(data) {
+      setRunning(false);
+      currentTimestamp = data.timestamp || null;
+      if (resultsSection) {
+        resultsSection.hidden = false;
+      }
+      if (resultsSummary) {
+        if (data.error) {
+          resultsSummary.textContent =
+            "Finished (" + data.status + "): " + data.error;
+        } else {
+          resultsSummary.textContent = "Finished with status: " + data.status + ".";
+        }
+      }
+      if (currentTimestamp) {
+        if (detailLink) {
+          detailLink.href = "/runs/" + encodeURIComponent(currentTimestamp);
+        }
+        if (compareLink) {
+          compareLink.href =
+            "/runs/" + encodeURIComponent(currentTimestamp) + "/compare";
+        }
+        // Discover output files via the run manifest, then render the
+        // pick-two-and-diff list (no raw bodies are pulled into the page).
+        fetch(
+          "/api/runs/" + encodeURIComponent(currentTimestamp) +
+            "/file?name=manifest.json",
+          { headers: { "Accept": "application/json" }, cache: "no-store" }
+        )
+          .then(function (resp) { return resp.ok ? resp.json() : null; })
+          .then(function (payload) {
+            var outputs = [];
+            if (payload && typeof payload.content === "string") {
+              try {
+                var manifest = JSON.parse(payload.content);
+                if (Array.isArray(manifest.outputs)) {
+                  outputs = manifest.outputs;
+                }
+              } catch (err) { /* manifest unreadable; empty list */ }
+            }
+            renderFileDiff(outputs);
+          })
+          .catch(function () { renderFileDiff([]); });
+      }
+    }
+
+    function poll(jobId) {
+      fetch("/api/progress/" + encodeURIComponent(jobId), {
+        headers: { "Accept": "application/json" },
+        cache: "no-store",
+      })
+        .then(function (resp) {
+          if (!resp.ok) {
+            throw new Error("HTTP " + resp.status);
+          }
+          return resp.json();
+        })
+        .then(function (data) {
+          render(data);
+          if (data.status && data.status !== "running") {
+            finish(data);
+            return; // stop polling
+          }
+          window.setTimeout(function () { poll(jobId); }, POLL_MS);
+        })
+        .catch(function () {
+          window.setTimeout(function () { poll(jobId); }, POLL_MS * 2);
+        });
+    }
+
+    function postOpen(target) {
+      if (!currentTimestamp) {
+        return;
+      }
+      if (openStatus) {
+        openStatus.textContent = "Opening " + target + "…";
+        openStatus.classList.remove("toolbar__hint--error");
+      }
+      fetch("/runs/" + encodeURIComponent(currentTimestamp) + "/open", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Requested-With": "XMLHttpRequest",
+        },
+        body: JSON.stringify({ target: target }),
+      })
+        .then(function (resp) {
+          return resp.json().then(function (body) {
+            return { ok: resp.ok, body: body };
+          });
+        })
+        .then(function (res) {
+          if (openStatus) {
+            if (res.ok && res.body && res.body.ok) {
+              openStatus.textContent = "Opened in " + target + ".";
+            } else {
+              openStatus.textContent =
+                (res.body && res.body.error) || "Could not open folder.";
+              openStatus.classList.add("toolbar__hint--error");
+            }
+          }
+        })
+        .catch(function () {
+          if (openStatus) {
+            openStatus.textContent = "Could not reach the server.";
+            openStatus.classList.add("toolbar__hint--error");
+          }
+        });
+    }
+
+    if (finderBtn) {
+      finderBtn.addEventListener("click", function () { postOpen("finder"); });
+    }
+    if (terminalBtn) {
+      terminalBtn.addEventListener("click", function () { postOpen("terminal"); });
+    }
+
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      clearFormError();
+      setRunning(true);
+      if (resultsSection) {
+        resultsSection.hidden = true;
+      }
+      if (fileDiffContainer) {
+        fileDiffContainer.textContent = "";
+      }
+      if (progressSection) {
+        progressSection.hidden = false;
+      }
+      render({ percent: 0, phase: "Starting", status: "running", log_tail: [] });
+
+      fetch("/run", {
+        method: "POST",
+        headers: { "X-Requested-With": "XMLHttpRequest", "Accept": "application/json" },
+        body: new FormData(form),
+      })
+        .then(function (resp) {
+          return resp.json().then(function (body) {
+            return { status: resp.status, body: body };
+          });
+        })
+        .then(function (res) {
+          if (res.status === 200 && res.body && res.body.job_id) {
+            poll(res.body.job_id);
+            return;
+          }
+          setRunning(false);
+          if (progressSection) {
+            progressSection.hidden = true;
+          }
+          var msg = (res.body && res.body.error) ||
+            ("Run could not be started (HTTP " + res.status + ").");
+          showFormError(msg);
+        })
+        .catch(function () {
+          setRunning(false);
+          if (progressSection) {
+            progressSection.hidden = true;
+          }
+          showFormError("Could not reach the server.");
+        });
+    });
+  })();
+</script>
 {% endblock %}

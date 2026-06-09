@@ -238,6 +238,23 @@ def parse_host_line(line):
 
     return router_ip, username, password, device_type
 
+
+def resolve_commands_file(device_type, base, controller_file, edge_file):
+    """Pick the commands file a host should run, based on its device type.
+
+    Controllers (vBond/vSmart/vEdge) prefer ``controller_file`` and edges
+    (cEdge / IOS-XE) prefer ``edge_file``. When the type-specific file is not
+    provided (``None``/empty) the positional ``base`` commands file is used as
+    a shared fallback. Returns the chosen path or ``None`` when no file is
+    available for the host (in which case the host connects but runs no
+    commands).
+    """
+    if device_type == DEVICE_CONTROLLER:
+        return controller_file or base
+    if device_type == DEVICE_EDGE:
+        return edge_file or base
+    return base
+
 # Boundary markers used in text output. They are designed to be easy to grep
 # (`^=====`) and to carry enough metadata for downstream tooling.
 SESSION_BEGIN_FMT = (
@@ -513,7 +530,10 @@ def connect_and_execute(
     Args:
         router_ip, username, password: SSH credentials.
         commands_file: path to a file with one command per line. Lines
-            starting with '#' and blank lines are skipped.
+            starting with '#' and blank lines are skipped. May be ``None``
+            (or empty), in which case the host is connected but no commands
+            are run -- useful when split controller/edge command lists leave
+            one device type without a list.
         output_paths: dict mapping output format -> destination file path.
             Use OUTPUT_FORMAT_TEXT/JSON/CSV as keys. May contain multiple.
         allow_unknown_hosts: if False, unknown SSH host keys are rejected.
@@ -768,7 +788,15 @@ def connect_and_execute(
         # Phase 5: Run the user's commands. Each command captures its own
         # metadata (start time, duration, exit kind) so that downstream
         # writers can render boundaries (Issue 9) and structured outputs
-        # (Issue 14).
+        # (Issue 14). A missing/empty commands_file (e.g. a device type with
+        # no split list) leaves the session connected but command-free.
+        if not commands_file:
+            log_message(
+                f"[{router_ip}] no commands file for device type "
+                f"{device_type}; connected but running no commands"
+            )
+            session_result["status"] = SESSION_OK
+            return session_result
         with open(commands_file, "r") as file:
             for line in file:
                 command = line.strip()
@@ -877,6 +905,9 @@ if __name__ == "__main__":
             "    python3 bulk-show.py hosts.txt commands.txt --output-format text,json,csv\n"
             "  Mix edges and controllers (vBond/vSmart) in one hosts file:\n"
             "    python3 bulk-show.py hosts.txt commands.txt\n"
+            "  Separate command lists per device type (controller vs edge):\n"
+            "    python3 bulk-show.py hosts.txt commands.txt \\\n"
+            "      --controller-commands ctrl.txt --edge-commands edge.txt\n"
             "\n"
             "Hosts file format: one host per line, comma-separated.\n"
             "  ip,username                       edge,  password prompted at startup\n"
@@ -897,7 +928,26 @@ if __name__ == "__main__":
              "optional device type ('controller'/'vsmart'/'vbond' or "
              "'type=controller'); defaults to edge.",
     )
-    parser.add_argument("commands_file", help="The file containing the list of commands")
+    parser.add_argument(
+        "commands_file",
+        help="Default/fallback file with the list of commands. Applied to any "
+             "device type that does not have a more specific list via "
+             "--controller-commands / --edge-commands.",
+    )
+    parser.add_argument(
+        "--controller-commands",
+        default=None,
+        help="Optional commands file applied only to controller hosts "
+             "(vBond/vSmart/vEdge). Falls back to the positional commands "
+             "file when omitted.",
+    )
+    parser.add_argument(
+        "--edge-commands",
+        default=None,
+        help="Optional commands file applied only to edge hosts "
+             "(cEdge/IOS-XE). Falls back to the positional commands file "
+             "when omitted.",
+    )
     parser.add_argument(
         "--port",
         type=int,
@@ -1001,6 +1051,18 @@ if __name__ == "__main__":
         )
         sys.exit(2)
 
+    # Validate the command files that were actually provided. The positional
+    # commands_file is always required; the split files are optional and only
+    # checked when supplied.
+    for label, path in (
+        ("commands_file", args.commands_file),
+        ("--controller-commands", args.controller_commands),
+        ("--edge-commands", args.edge_commands),
+    ):
+        if path and not os.path.isfile(path):
+            print(f"{label} not found: {path}", file=sys.stderr)
+            sys.exit(2)
+
     # Warn once when MITM-risky AutoAddPolicy is in effect.
     if not args.reject_unknown_hosts:
         print(
@@ -1099,6 +1161,14 @@ if __name__ == "__main__":
             else:
                 effective_port = args.port
 
+            # Resolve the command list this host should run from its type.
+            commands_file = resolve_commands_file(
+                device_type,
+                args.commands_file,
+                args.controller_commands,
+                args.edge_commands,
+            )
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_paths = _build_output_paths(
                 logs_dir, router_ip, timestamp, args.output_format
@@ -1108,7 +1178,7 @@ if __name__ == "__main__":
                 router_ip,
                 username,
                 effective_password,
-                args.commands_file,
+                commands_file,
                 output_paths,
                 not args.reject_unknown_hosts,
                 effective_port,

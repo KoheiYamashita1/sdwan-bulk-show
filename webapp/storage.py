@@ -13,11 +13,12 @@ crafted ``..`` or symlink from reading arbitrary files.
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 from .runner import LOGS_DIR, REPO_ROOT
 
@@ -175,6 +176,68 @@ def read_file_text(timestamp: str, filename: str, *, max_bytes: int = MAX_VIEW_B
     return raw.decode("utf-8", errors="replace"), truncated
 
 
+def build_unified_diff(
+    a_name: str,
+    a_text: str,
+    b_name: str,
+    b_text: str,
+    *,
+    a_truncated: bool = False,
+    b_truncated: bool = False,
+) -> dict:
+    """Build the JSON payload for a unified diff of two already-read files.
+
+    Pure (no filesystem / network access) so it can be unit-tested in
+    isolation. ``a_text`` / ``b_text`` are the file bodies as returned by
+    :func:`read_file_text` (already bounded by ``MAX_VIEW_BYTES``). The
+    returned ``diff`` list holds plain-text unified-diff lines; the browser
+    colourises them by leading character. ``identical`` is ``True`` when the
+    two bodies are byte-for-byte equal (i.e. ``unified_diff`` yields nothing).
+    """
+
+    a_lines = a_text.splitlines()
+    b_lines = b_text.splitlines()
+    diff = list(
+        difflib.unified_diff(
+            a_lines, b_lines, fromfile=a_name, tofile=b_name, lineterm=""
+        )
+    )
+    return {
+        "a": a_name,
+        "b": b_name,
+        "a_truncated": bool(a_truncated),
+        "b_truncated": bool(b_truncated),
+        "diff": diff,
+        "identical": not diff,
+    }
+
+
+def diff_files(
+    timestamp: str,
+    a_name: str,
+    b_name: str,
+    *,
+    max_bytes: int = MAX_VIEW_BYTES,
+) -> dict:
+    """Resolve, read, and diff two files in ``logs/<timestamp>/``.
+
+    Both files are resolved through :func:`read_file_text`, so path-traversal
+    safety and ``MAX_VIEW_BYTES`` truncation are inherited. Raises
+    :class:`StorageError` if either file is missing or unsafe.
+    """
+
+    a_text, a_truncated = read_file_text(timestamp, a_name, max_bytes=max_bytes)
+    b_text, b_truncated = read_file_text(timestamp, b_name, max_bytes=max_bytes)
+    return build_unified_diff(
+        a_name,
+        a_text,
+        b_name,
+        b_text,
+        a_truncated=a_truncated,
+        b_truncated=b_truncated,
+    )
+
+
 def read_manifest(timestamp: str) -> Optional[dict]:
     """Return the parsed ``manifest.json`` for ``timestamp`` or ``None``."""
 
@@ -227,6 +290,8 @@ __all__ = [
     "RunSummary",
     "StorageError",
     "TIMESTAMP_RE",
+    "build_unified_diff",
+    "diff_files",
     "get_run",
     "list_run_files",
     "list_runs",

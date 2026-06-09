@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import unittest
 from pathlib import Path
 from threading import Thread
@@ -33,6 +34,8 @@ def _form(**overrides) -> runner.RunForm:
         remote_dir="/home/admin",
         hosts_text="10.0.0.1,admin,p1\n10.0.0.2,admin,p2\n",
         commands_text="show version\nshow ip route summary\n",
+        controller_commands_text="",
+        edge_commands_text="",
         download_outputs=True,
         verbose=False,
         reject_unknown_hosts=False,
@@ -295,6 +298,340 @@ class RunLockTests(_IsolatedRepoMixin, unittest.TestCase):
         # After releasing, a fresh run must succeed.
         result = self._run(repo_root=repo, env={"FAKE_RUN_TS": "20260105_050505"})
         self.assertEqual(result.timestamp, "20260105_050505")
+
+
+# ---------------------------------------------------------------------------
+# Progress parsing (RunJob.update_from_line)
+# ---------------------------------------------------------------------------
+
+
+class ProgressParsingTests(unittest.TestCase):
+    def _job(self) -> runner.RunJob:
+        # 2 hosts x 2 commands = 4 total command milestones. ``commands_total``
+        # is now the accurate denominator directly (not multiplied by hosts).
+        return runner.RunJob.new(hosts_total=2, commands_total=4)
+
+    def test_milestone_percent_and_phase_transitions(self) -> None:
+        job = self._job()
+
+        job.update_from_line("[vmanage] connecting...")
+        self.assertEqual(job.percent, 5)
+        self.assertEqual(job.phase, "Connecting to vManage")
+
+        job.update_from_line("[vmanage] connected")
+        self.assertEqual(job.percent, 10)
+        self.assertEqual(job.phase, "Connected to vManage")
+
+        job.update_from_line("[vmanage] uploading files to /home/admin")
+        self.assertEqual(job.percent, 20)
+        self.assertEqual(job.phase, "Uploading files")
+
+        job.update_from_line("[vmanage] running via vshell session")
+        self.assertEqual(job.percent, 25)
+        self.assertEqual(job.phase, "Running on vManage")
+
+    def test_command_done_counter_and_fine_grained_percent(self) -> None:
+        job = self._job()
+        job.update_from_line("[vmanage] running via vshell session")
+        job.update_from_line("[main] starting 2 host(s) x 2 command(s)")
+        self.assertEqual(job.hosts_total, 2)
+
+        # An edge "connected" line must not regress the bar from 25.
+        job.update_from_line("[10.0.0.1] connected")
+        self.assertEqual(job.percent, 25)
+
+        # Four commands complete -> 25 + 65 * (n/4).
+        job.update_from_line("[10.0.0.1] done: show version")
+        self.assertEqual(job.commands_done, 1)
+        self.assertEqual(job.percent, 25 + int(65 * (1 / 4)))  # 41
+
+        job.update_from_line("[10.0.0.1] done: show ip route")
+        self.assertEqual(job.commands_done, 2)
+        self.assertEqual(job.percent, 25 + int(65 * (2 / 4)))  # 57
+
+        job.update_from_line("[10.0.0.2] done: show version")
+        job.update_from_line("[10.0.0.2] done: show ip route")
+        self.assertEqual(job.commands_done, 4)
+        self.assertEqual(job.percent, 90)
+
+    def test_main_done_does_not_increment_command_counter(self) -> None:
+        job = self._job()
+        job.update_from_line("[10.0.0.1] done: show version")
+        self.assertEqual(job.commands_done, 1)
+
+        job.update_from_line("[main] done: success=2, failed=0")
+        self.assertEqual(job.commands_done, 1, "[main] done: must NOT count as a command")
+        self.assertEqual(job.percent, 92)
+        self.assertEqual(job.phase, "Finalizing run")
+
+    def test_download_and_vmanage_done_milestones(self) -> None:
+        job = self._job()
+        job.update_from_line("[main] done: success=2, failed=0")
+        job.update_from_line("[vmanage] downloading output_10.0.0.1.txt -> logs/...")
+        self.assertEqual(job.percent, 95)
+        self.assertEqual(job.phase, "Downloading outputs")
+
+        job.update_from_line("[vmanage] done")
+        self.assertEqual(job.percent, 98)
+        self.assertEqual(job.phase, "Wrapping up")
+
+    def test_percent_is_monotonic(self) -> None:
+        job = self._job()
+        job.update_from_line("[vmanage] running via vshell session")  # 25
+        job.update_from_line("[vmanage] connecting...")  # would be 5
+        self.assertEqual(job.percent, 25, "percent must never move backwards")
+
+    def test_log_tail_is_capped_and_stores_given_lines(self) -> None:
+        job = self._job()
+        for i in range(runner.LOG_TAIL_MAX + 25):
+            job.update_from_line(f"line {i}")
+        snap = job.snapshot()
+        self.assertEqual(len(snap["log_tail"]), runner.LOG_TAIL_MAX)
+        # Oldest lines were dropped; newest retained.
+        self.assertEqual(snap["log_tail"][-1], f"line {runner.LOG_TAIL_MAX + 24}")
+
+    def test_masked_line_keeps_password_out_of_log_tail(self) -> None:
+        job = self._job()
+        secret = "hunter2"
+        # update_from_line is always fed already-masked lines by the runner.
+        masked = runner._mask_password(f"[x] password is {secret}", secret)
+        job.update_from_line(masked)
+        snap = job.snapshot()
+        joined = "\n".join(snap["log_tail"])
+        self.assertNotIn(secret, joined)
+        self.assertIn("***", joined)
+
+
+# ---------------------------------------------------------------------------
+# Asynchronous execution (start_run_async + job registry)
+# ---------------------------------------------------------------------------
+
+
+class StartRunAsyncTests(_IsolatedRepoMixin, unittest.TestCase):
+    def setUp(self) -> None:
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory(prefix="webapp-runner-async-")
+        self.addCleanup(self._tmp.cleanup)
+
+    def tearDown(self) -> None:
+        if runner.RUN_LOCK.locked():
+            try:
+                runner.RUN_LOCK.release()
+            except RuntimeError:
+                pass
+
+    def _start(self, **overrides) -> str:
+        repo = overrides.pop("repo_root", None) or self._make_repo()
+        env_overrides = overrides.pop("env", {})
+        form = overrides.pop("form", _form())
+
+        # The worker thread reads these env vars asynchronously, so we must
+        # keep them set past this call; restore via addCleanup, not a finally.
+        previous_env = {k: os.environ.get(k) for k in env_overrides}
+
+        def _restore() -> None:
+            for k, original in previous_env.items():
+                if original is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = original
+
+        os.environ.update({k: v for k, v in env_overrides.items() if v is not None})
+        self.addCleanup(_restore)
+        return runner.start_run_async(
+            form,
+            repo_root=repo,
+            bulk_script=REAL_BULK_SCRIPT,
+            run_on_vmanage=FAKE_RUN_ON_VMANAGE,
+            python_executable=sys.executable,
+            timeout=30.0,
+        )
+
+    def _wait_for_finish(self, job_id: str, timeout: float = 15.0) -> dict:
+        deadline = time.monotonic() + timeout
+        snap = runner.job_snapshot(job_id)
+        while snap and snap["status"] == "running":
+            if time.monotonic() > deadline:
+                self.fail(f"job {job_id} did not finish within {timeout}s")
+            time.sleep(0.05)
+            snap = runner.job_snapshot(job_id)
+        self.assertIsNotNone(snap, "job snapshot disappeared")
+        return snap
+
+    def test_happy_path_sets_success_timestamp_and_releases_lock(self) -> None:
+        repo = self._make_repo()
+        job_id = self._start(
+            repo_root=repo,
+            env={"FAKE_RUN_TS": "20260201_010101", "FAKE_RUN_LEAK_PASSWORD": "1"},
+            form=_form(password="topSecret!42"),
+        )
+        self.assertTrue(job_id)
+
+        snap = self._wait_for_finish(job_id)
+        self.assertEqual(snap["status"], "success")
+        self.assertEqual(snap["timestamp"], "20260201_010101")
+        self.assertEqual(snap["percent"], 100)
+        self.assertIsNotNone(snap["ended_at"])
+
+        # The promoted outputs really landed on disk.
+        run_dir = repo / "logs" / "20260201_010101"
+        self.assertTrue((run_dir / "manifest.json").is_file())
+
+        # The lock is released once the worker thread finishes.
+        self.assertFalse(runner.RUN_LOCK.locked(), "RUN_LOCK must be released")
+
+        # The streamed log tail is password-masked, never raw.
+        joined = "\n".join(snap["log_tail"])
+        self.assertNotIn("topSecret!42", joined)
+
+    def test_unknown_job_id_snapshot_is_none(self) -> None:
+        self.assertIsNone(runner.job_snapshot("does-not-exist"))
+
+    def test_busy_lock_makes_start_run_async_raise(self) -> None:
+        repo = self._make_repo()
+        self.assertTrue(runner.RUN_LOCK.acquire(blocking=False))
+        try:
+            with self.assertRaises(runner.RunBusyError):
+                self._start(repo_root=repo, env={"FAKE_RUN_TS": "20260202_020202"})
+        finally:
+            runner.RUN_LOCK.release()
+
+        # After releasing, an async run succeeds and releases the lock again.
+        job_id = self._start(
+            repo_root=repo, env={"FAKE_RUN_TS": "20260202_020202"}
+        )
+        snap = self._wait_for_finish(job_id)
+        self.assertEqual(snap["status"], "success")
+        self.assertFalse(runner.RUN_LOCK.locked())
+
+
+# ---------------------------------------------------------------------------
+# Split command lists: fallback rule, argv, manifest counts, progress total
+# ---------------------------------------------------------------------------
+
+
+class SplitCommandsTests(unittest.TestCase):
+    def test_each_type_uses_its_own_box(self) -> None:
+        form = _form(
+            commands_text="",
+            controller_commands_text="show control connections\n",
+            edge_commands_text="show ip route\n",
+        )
+        self.assertEqual(form.controller_commands(), "show control connections\n")
+        self.assertEqual(form.edge_commands(), "show ip route\n")
+        self.assertEqual(form.controller_commands_count(), 1)
+        self.assertEqual(form.edge_commands_count(), 1)
+
+    def test_empty_box_falls_back_to_other_box(self) -> None:
+        form = _form(
+            commands_text="",
+            controller_commands_text="",
+            edge_commands_text="show ip route\nshow version\n",
+        )
+        # Controllers have no list of their own, so they reuse the edge box.
+        self.assertEqual(form.controller_commands(), "show ip route\nshow version\n")
+        self.assertEqual(form.edge_commands(), "show ip route\nshow version\n")
+
+    def test_legacy_commands_text_seeds_both_types(self) -> None:
+        form = _form(
+            commands_text="show version\n",
+            controller_commands_text="",
+            edge_commands_text="",
+        )
+        self.assertEqual(form.controller_commands(), "show version\n")
+        self.assertEqual(form.edge_commands(), "show version\n")
+        # base_commands prefers the legacy box for the positional file.
+        self.assertEqual(form.base_commands(), "show version\n")
+
+    def test_validate_rejects_all_command_boxes_empty(self) -> None:
+        with self.assertRaises(runner.RunInputError):
+            runner.validate_form(
+                _form(commands_text="", controller_commands_text="",
+                      edge_commands_text="")
+            )
+
+    def test_validate_accepts_only_controller_box(self) -> None:
+        runner.validate_form(
+            _form(commands_text="", controller_commands_text="show foo\n",
+                  edge_commands_text="")
+        )
+
+    def test_build_argv_includes_split_flags_when_named(self) -> None:
+        argv = runner._build_argv(
+            python_executable="py",
+            run_on_vmanage=Path("/x/run_on_vmanage.py"),
+            form=_form(),
+            tempdir=Path("/tmp/x"),
+            hosts_name="host.txt",
+            commands_name="command.txt",
+            bulk_name="bulk-show.py",
+            controller_commands_name="controller_command.txt",
+            edge_commands_name="edge_command.txt",
+        )
+        self.assertIn("--controller-commands", argv)
+        self.assertIn("controller_command.txt", argv)
+        self.assertIn("--edge-commands", argv)
+        self.assertIn("edge_command.txt", argv)
+
+    def test_build_argv_omits_split_flags_when_absent(self) -> None:
+        argv = runner._build_argv(
+            python_executable="py",
+            run_on_vmanage=Path("/x/run_on_vmanage.py"),
+            form=_form(),
+            tempdir=Path("/tmp/x"),
+            hosts_name="host.txt",
+            commands_name="command.txt",
+            bulk_name="bulk-show.py",
+        )
+        self.assertNotIn("--controller-commands", argv)
+        self.assertNotIn("--edge-commands", argv)
+
+    def test_progress_total_sums_per_host_type_counts(self) -> None:
+        # One controller (2 cmds) + one edge (1 cmd) -> 3 milestones total.
+        form = _form(
+            hosts_text="10.0.0.1,admin,p1,type=controller\n10.0.0.2,admin,p2\n",
+            commands_text="",
+            controller_commands_text="show a\nshow b\n",
+            edge_commands_text="show c\n",
+        )
+        self.assertEqual(form.progress_command_total(REAL_BULK_SCRIPT), 3)
+
+
+class SplitCommandsRunTests(_IsolatedRepoMixin, unittest.TestCase):
+    def setUp(self) -> None:
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory(prefix="webapp-split-test-")
+        self.addCleanup(self._tmp.cleanup)
+
+    def tearDown(self) -> None:
+        if runner.RUN_LOCK.locked():
+            try:
+                runner.RUN_LOCK.release()
+            except RuntimeError:
+                pass
+
+    def test_manifest_records_both_command_counts(self) -> None:
+        repo = self._make_repo()
+        result = self._run(
+            repo_root=repo,
+            env={"FAKE_RUN_TS": "20260301_030303"},
+            form=_form(
+                commands_text="",
+                controller_commands_text="show a\nshow b\n",
+                edge_commands_text="show c\n",
+            ),
+        )
+        manifest = json.loads(
+            (repo / "logs" / result.timestamp / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(manifest["controller_commands_count"], 2)
+        self.assertEqual(manifest["edge_commands_count"], 1)
+        # Backward-compatible single figure stays present (max of both).
+        self.assertEqual(manifest["commands_count"], 2)
 
 
 if __name__ == "__main__":  # pragma: no cover
