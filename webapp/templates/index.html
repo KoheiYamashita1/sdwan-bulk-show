@@ -152,7 +152,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/filediff.js"></script>
+<script src="/static/filediff.js?v={{ asset_version }}"></script>
 <script>
   // Client-side settings import/export. Everything happens in the browser:
   // the JSON file is read locally and the form is prefilled, so no settings

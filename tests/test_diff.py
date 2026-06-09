@@ -64,6 +64,52 @@ class BuildUnifiedDiffTests(unittest.TestCase):
         for line in payload["diff"]:
             self.assertFalse(line.endswith("\n"), f"line had trailing newline: {line!r}")
 
+    def test_payload_includes_side_by_side_rows(self) -> None:
+        payload = storage.build_unified_diff(
+            "a.txt", "alpha\nbravo\n", "b.txt", "alpha\ncharlie\n"
+        )
+        self.assertIn("rows", payload)
+        tags = [row["tag"] for row in payload["rows"]]
+        self.assertEqual(tags[0], "equal")
+        self.assertIn("replace", tags)
+
+
+class BuildSideBySideTests(unittest.TestCase):
+    def test_equal_lines_pair_left_and_right(self) -> None:
+        rows = storage.build_side_by_side(["x", "y"], ["x", "y"])
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r["tag"] == "equal" for r in rows))
+        self.assertEqual(rows[0], {"tag": "equal", "ln": 1, "left": "x", "rn": 1, "right": "x"})
+
+    def test_replace_pairs_left_and_right(self) -> None:
+        rows = storage.build_side_by_side(["old"], ["new"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["tag"], "replace")
+        self.assertEqual(rows[0]["left"], "old")
+        self.assertEqual(rows[0]["right"], "new")
+
+    def test_delete_has_empty_right(self) -> None:
+        rows = storage.build_side_by_side(["keep", "gone"], ["keep"])
+        deleted = [r for r in rows if r["tag"] == "delete"]
+        self.assertEqual(len(deleted), 1)
+        self.assertEqual(deleted[0]["left"], "gone")
+        self.assertIsNone(deleted[0]["right"])
+        self.assertIsNone(deleted[0]["rn"])
+
+    def test_insert_has_empty_left(self) -> None:
+        rows = storage.build_side_by_side(["keep"], ["keep", "added"])
+        inserted = [r for r in rows if r["tag"] == "insert"]
+        self.assertEqual(len(inserted), 1)
+        self.assertEqual(inserted[0]["right"], "added")
+        self.assertIsNone(inserted[0]["left"])
+        self.assertIsNone(inserted[0]["ln"])
+
+    def test_uneven_replace_surplus_becomes_insert(self) -> None:
+        rows = storage.build_side_by_side(["a"], ["b", "c"])
+        self.assertEqual(rows[0]["tag"], "replace")
+        self.assertEqual(rows[1]["tag"], "insert")
+        self.assertEqual(rows[1]["right"], "c")
+
 
 # ---------------------------------------------------------------------------
 # GET /api/runs/<ts>/diff endpoint
@@ -100,6 +146,9 @@ class DiffEndpointTests(unittest.TestCase):
         self.assertEqual(data["b"], "output_b.txt")
         self.assertFalse(data["identical"])
         self.assertTrue(any(line.startswith("+charlie") for line in data["diff"]))
+        # Side-by-side rows are present for the two-column renderer.
+        self.assertIn("rows", data)
+        self.assertTrue(any(row["tag"] == "replace" for row in data["rows"]))
 
     def test_self_diff_is_identical(self) -> None:
         r = self.client.get(

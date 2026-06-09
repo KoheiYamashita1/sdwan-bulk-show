@@ -39,7 +39,7 @@
 
 {% block scripts %}
 {% if not error %}
-<script src="/static/filediff.js"></script>
+<script src="/static/filediff.js?v={{ asset_version }}"></script>
 <script>
   (function () {
     "use strict";

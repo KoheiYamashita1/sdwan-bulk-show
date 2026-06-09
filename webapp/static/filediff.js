@@ -18,26 +18,46 @@
     return node;
   }
 
-  // Render unified-diff lines into a <pre>, colouring by leading character.
-  // Each line becomes its own <span> so CSS classes can tint it; textContent
-  // keeps it inert.
-  function renderDiff(bodyEl, lines) {
+  // Render aligned rows as a two-column (left/right) table, tinting each side
+  // by the row tag. textContent only, so device output / diff text stays
+  // inert. `rows` come from the server (storage.build_side_by_side).
+  function renderSideBySide(bodyEl, rows) {
     bodyEl.textContent = "";
-    lines.forEach(function (line) {
-      var row = el("span", "diffline");
-      var head = line.charAt(0);
-      if (line.indexOf("@@") === 0) {
-        row.classList.add("diffline--hunk");
-      } else if (head === "+") {
-        row.classList.add("diffline--add");
-      } else if (head === "-") {
-        row.classList.add("diffline--del");
+    var table = el("table", "sxs");
+    var tbody = el("tbody");
+
+    function cell(lineNo, text, side, tag) {
+      var num = el("td", "sxs__ln");
+      num.textContent = lineNo == null ? "" : String(lineNo);
+      var code = el("td", "sxs__code sxs__code--" + side);
+      if (text == null) {
+        code.classList.add("sxs__code--empty");
       } else {
-        row.classList.add("diffline--ctx");
+        // A removed line tints the left side red; an added line tints the
+        // right side green; replaced lines tint both.
+        if (side === "left" && (tag === "delete" || tag === "replace")) {
+          code.classList.add("sxs__code--del");
+        } else if (side === "right" && (tag === "insert" || tag === "replace")) {
+          code.classList.add("sxs__code--add");
+        }
+        code.textContent = text;
       }
-      row.textContent = line + "\n";
-      bodyEl.appendChild(row);
+      return [num, code];
+    }
+
+    rows.forEach(function (r) {
+      var tr = el("tr", "sxs__row sxs__row--" + r.tag);
+      var left = cell(r.ln, r.left, "left", r.tag);
+      var right = cell(r.rn, r.right, "right", r.tag);
+      tr.appendChild(left[0]);
+      tr.appendChild(left[1]);
+      tr.appendChild(right[0]);
+      tr.appendChild(right[1]);
+      tbody.appendChild(tr);
     });
+
+    table.appendChild(tbody);
+    bodyEl.appendChild(table);
   }
 
   function init(opts) {
@@ -161,7 +181,7 @@
     var panel = el("section", "filediff__panel");
     panel.hidden = true;
     var header = el("div", "filediff__header");
-    var body = el("pre", "filediff__body");
+    var body = el("div", "filediff__body");
     panel.appendChild(header);
     panel.appendChild(body);
     container.appendChild(panel);
@@ -194,12 +214,11 @@
           header.textContent = data.a + " \u2194 " + data.b;
           if (data.identical) {
             body.textContent = "";
-            renderDiff(body, []);
-            var note = el("span", "diffline diffline--ctx");
+            var note = el("p", "filediff__identical");
             note.textContent = "Files are identical.";
             body.appendChild(note);
           } else {
-            renderDiff(body, data.diff || []);
+            renderSideBySide(body, data.rows || []);
           }
           var trunc = [];
           if (data.a_truncated) {

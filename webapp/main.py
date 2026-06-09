@@ -22,6 +22,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -55,6 +56,12 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+# Cache-busting token for static assets. Computed once at process start, so a
+# server restart (which we do on every code change) forces browsers to refetch
+# CSS/JS instead of serving a stale cached copy. Templates append
+# ``?v={{ asset_version }}`` to /static URLs.
+templates.env.globals["asset_version"] = int(time.time())
 
 
 # ---------------------------------------------------------------------------

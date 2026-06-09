@@ -79,7 +79,7 @@
 
 {% block scripts %}
 {% if not error %}
-<script src="/static/filediff.js"></script>
+<script src="/static/filediff.js?v={{ asset_version }}"></script>
 <script>
   // Wire up the pick-two-and-diff widget plus the open-folder buttons.
   (function () {

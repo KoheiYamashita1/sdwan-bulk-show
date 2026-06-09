@@ -704,6 +704,25 @@ a:hover {
   border: 1px solid var(--border);
   border-radius: 6px;
   overflow: hidden;
+  /* Full-bleed: break out of the centered 960px container so the two-column
+     diff can use almost the full viewport width. Relies on the container
+     being horizontally centered (its center ≈ the viewport center). */
+  position: relative;
+  left: 50%;
+  width: 96vw;
+  max-width: 96vw;
+  margin-left: -48vw;
+}
+
+@media (max-width: 1000px) {
+  /* On narrow screens the container already fills the width, so skip the
+     break-out to avoid a tiny horizontal jiggle. */
+  .filediff__panel {
+    left: auto;
+    width: auto;
+    max-width: 100%;
+    margin-left: 0;
+  }
 }
 
 .filediff__header {
@@ -718,15 +737,72 @@ a:hover {
 
 .filediff__body {
   margin: 0;
-  background: var(--code-bg);
-  color: var(--code-fg);
-  padding: 0.6rem 0.7rem;
-  max-height: 28rem;
+  background: var(--card);
+  color: var(--fg);
+  max-height: 32rem;
   overflow: auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.78rem;
-  line-height: 1.4;
-  white-space: pre;
+  line-height: 1.45;
+}
+
+.filediff__identical {
+  margin: 0;
+  padding: 0.8rem;
+  color: var(--fg-muted);
+  font-style: italic;
+}
+
+/* Side-by-side (two-column) diff table */
+.sxs {
+  border-collapse: collapse;
+  width: 100%;
+  table-layout: fixed;
+}
+
+.sxs__ln {
+  width: 3.2em;
+  min-width: 3.2em;
+  padding: 0 0.5em;
+  text-align: right;
+  color: var(--fg-muted);
+  background: #f8fafc;
+  border-right: 1px solid var(--border);
+  user-select: none;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+.sxs__code {
+  width: 50%;
+  padding: 0 0.6em;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+
+.sxs__code--right {
+  border-left: 1px solid var(--border);
+}
+
+/* Tints: removed (left) red, added (right) green, changed both. */
+.sxs__code--del {
+  background: #fef2f2;
+  color: #991b1b;
+}
+
+.sxs__code--add {
+  background: #ecfdf5;
+  color: #065f46;
+}
+
+.sxs__code--empty {
+  background: #f8fafc;
+}
+
+.sxs__row:hover .sxs__code {
+  filter: brightness(0.985);
 }
 
 .diffline {

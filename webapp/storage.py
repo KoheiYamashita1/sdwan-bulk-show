@@ -208,8 +208,85 @@ def build_unified_diff(
         "a_truncated": bool(a_truncated),
         "b_truncated": bool(b_truncated),
         "diff": diff,
+        "rows": build_side_by_side(a_lines, b_lines),
         "identical": not diff,
     }
+
+
+def build_side_by_side(a_lines: list[str], b_lines: list[str]) -> list[dict]:
+    """Align two line lists into left/right rows for a side-by-side diff.
+
+    Pure (no I/O) so it is unit-testable. Returns a list of row dicts::
+
+        {"tag": "equal"|"replace"|"delete"|"insert",
+         "ln": <left 1-based line no | None>,  "left":  <str | None>,
+         "rn": <right 1-based line no | None>, "right": <str | None>}
+
+    The browser renders each row as two columns and tints by ``tag``:
+    ``equal`` neutral, ``delete`` (left only) red, ``insert`` (right only)
+    green, ``replace`` red-left / green-right. Within a ``replace`` block the
+    two sides are paired positionally; any surplus lines on one side become
+    ``delete`` / ``insert`` rows so nothing is dropped.
+    """
+
+    rows: list[dict] = []
+    matcher = difflib.SequenceMatcher(a=a_lines, b=b_lines, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                rows.append(
+                    {
+                        "tag": "equal",
+                        "ln": i1 + k + 1,
+                        "left": a_lines[i1 + k],
+                        "rn": j1 + k + 1,
+                        "right": b_lines[j1 + k],
+                    }
+                )
+        elif tag == "delete":
+            for k in range(i2 - i1):
+                rows.append(
+                    {
+                        "tag": "delete",
+                        "ln": i1 + k + 1,
+                        "left": a_lines[i1 + k],
+                        "rn": None,
+                        "right": None,
+                    }
+                )
+        elif tag == "insert":
+            for k in range(j2 - j1):
+                rows.append(
+                    {
+                        "tag": "insert",
+                        "ln": None,
+                        "left": None,
+                        "rn": j1 + k + 1,
+                        "right": b_lines[j1 + k],
+                    }
+                )
+        else:  # replace
+            la = i2 - i1
+            lb = j2 - j1
+            for k in range(max(la, lb)):
+                has_left = k < la
+                has_right = k < lb
+                if has_left and has_right:
+                    row_tag = "replace"
+                elif has_left:
+                    row_tag = "delete"
+                else:
+                    row_tag = "insert"
+                rows.append(
+                    {
+                        "tag": row_tag,
+                        "ln": i1 + k + 1 if has_left else None,
+                        "left": a_lines[i1 + k] if has_left else None,
+                        "rn": j1 + k + 1 if has_right else None,
+                        "right": b_lines[j1 + k] if has_right else None,
+                    }
+                )
+    return rows
 
 
 def diff_files(
@@ -290,6 +367,7 @@ __all__ = [
     "RunSummary",
     "StorageError",
     "TIMESTAMP_RE",
+    "build_side_by_side",
     "build_unified_diff",
     "diff_files",
     "get_run",
