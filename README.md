@@ -313,6 +313,57 @@ $ more host.txt
 4.1.1.1,admin,admin
 ```
 
+## Targeting controllers (vBond / vSmart)
+
+By default every host is treated as an **edge** (cEdge / IOS-XE SD-WAN):
+connected on TCP/830, entering the device `shell`, and possibly re-prompting
+for the password a second time.
+
+To collect logs from **controllers** (vBond / vSmart) — typically with vManage
+acting as a jump server — mark the host with a device type. Controllers are
+connected on `--controller-port` (default **22**) with a **single** password
+and **no** `shell` step; pagination is disabled with the viptela CLI
+`paginate false`.
+
+A device type can be given as a bare keyword (`controller`, `vsmart`, `vbond`)
+or, unambiguously, as a `type=` token. Edges and controllers can be mixed in
+the same hosts file:
+
+```bash
+$ more host.txt
+# ip,username[,password][,type]   (type defaults to "edge")
+2.1.1.1,admin
+3.1.1.1,admin,secret
+10.0.0.5,admin,controller
+10.0.0.6,admin,secret,vsmart
+10.0.0.7,admin,type=controller
+```
+
+Line by line:
+
+| Entry | Meaning |
+| --- | --- |
+| `2.1.1.1,admin` | edge, password prompted once at startup |
+| `3.1.1.1,admin,secret` | edge, password embedded (not recommended) |
+| `10.0.0.5,admin,controller` | vBond/vSmart, password prompted at startup |
+| `10.0.0.6,admin,secret,vsmart` | vBond/vSmart, password embedded |
+| `10.0.0.7,admin,type=controller` | explicit device type (also: `type=edge`) |
+
+> Inline `#` comments are **not** supported on host entries — only whole lines
+> whose first non-space character is `#` are treated as comments. Keep
+> annotations out of the host lines themselves.
+
+Notes:
+
+- The same shared password (from the `getpass` prompt or `--password-prompt`)
+  is reused across edges and controllers, so a single mixed run works when the
+  credentials match.
+- In the rare case a literal password equals a type keyword (e.g. a password of
+  `controller`), use the unambiguous `type=` form or the 4-column
+  `ip,user,password,type` layout.
+- Override the controller port with `--controller-port` only if your controllers
+  do not use the conventional TCP/22.
+
 The command file contains the show commands you want to run.
 
 Example commands file:
@@ -341,7 +392,8 @@ python3 bulk-show.py host.txt command.txt --reject-unknown-hosts
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--port PORT` | `830` | SSH TCP port used for every host. SD-WAN edges (cEdge / IOS-XE SD-WAN) expose the interactive SSH service used by vManage `vshell` on 830, **not** 22. Override only for non-SD-WAN devices. |
+| `--port PORT` | `830` | SSH TCP port used for **edge** hosts. SD-WAN edges (cEdge / IOS-XE SD-WAN) expose the interactive SSH service used by vManage `vshell` on 830, **not** 22. Override only for non-SD-WAN devices. |
+| `--controller-port PORT` | `22` | SSH TCP port used for hosts marked as **controllers** (vBond / vSmart). When reached through vManage as a jump server, controllers land directly in the viptela CLI on the conventional port 22 with a single password and no `shell` step. |
 | `--reject-unknown-hosts` | off (auto-add + WARN) | Reject host keys not present in `~/.ssh/known_hosts` (MITM protection). |
 | `--password-prompt` | off | Prompt once for a shared password and override any embedded passwords. |
 | `--logs-dir LOGS_DIR` | `logs` | Directory where output files are written. |
@@ -351,6 +403,8 @@ python3 bulk-show.py host.txt command.txt --reject-unknown-hosts
 | `--output-format LIST` | `text` | Comma-separated; combine any of `text,json,csv`. Each format produces an additional per-host file. |
 
 ## SD-WAN authentication notes
+
+### Edges (default)
 
 When `bulk-show.py` is launched from the vManage `vshell` (the recommended
 deployment via `run_on_vmanage.py`), each SD-WAN edge is reached on
@@ -368,6 +422,18 @@ If the second prompt rejects the password, the session ends with status
 password for both prompts**; the script does not currently support distinct
 transport- vs shell-level credentials.
 
+### Controllers (vBond / vSmart)
+
+Hosts marked as controllers (see [Targeting controllers](#targeting-controllers-vbond--vsmart))
+behave differently. With vManage acting as a jump server, a controller is
+reached on **TCP/22** and lands directly in the viptela CLI:
+
+1. **SSH transport layer** — the password is sent during the SSH handshake.
+   This is the **only** password prompt; there is no `shell` sub-process and
+   therefore no second `Password:` prompt.
+2. **Pagination** — the script sends the viptela CLI `paginate false` (instead
+   of the IOS-XE `terminal length 0`) before running the show commands.
+
 Examples (new options):
 
 ```bash
@@ -384,6 +450,10 @@ python3 bulk-show.py host.txt command.txt --retries 3 --retry-delay 10
 
 # Emit text + JSON + CSV per host for downstream automation.
 python3 bulk-show.py host.txt command.txt --output-format text,json,csv
+
+# Mixed edges + controllers in host.txt (mark controllers with a type token);
+# controllers use TCP/22 by default. Override the controller port if needed.
+python3 bulk-show.py host.txt command.txt --controller-port 22
 ```
 
 # Output logs

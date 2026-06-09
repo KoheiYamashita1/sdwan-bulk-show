@@ -309,6 +309,55 @@ $ more host.txt
 4.1.1.1,admin,admin
 ```
 
+## コントローラ (vBond / vSmart) を対象にする
+
+既定では、すべてのホストを **エッジ** (cEdge / IOS-XE SD-WAN) として扱います。
+エッジは TCP/830 で接続し、デバイス内 `shell` に入り、必要に応じて
+パスワードを 2 回目に再要求されます。
+
+**コントローラ** (vBond / vSmart) のログを取得する場合 — 通常は vManage を
+踏み台 (Jump Server) として — ホストにデバイス種別を指定します。コントローラは
+`--controller-port`（既定 **22**）で接続し、パスワードは **1 回だけ**、`shell`
+には **入りません**。ページングは viptela CLI の `paginate false` で無効化します。
+
+デバイス種別はキーワード（`controller` / `vsmart` / `vbond`）または、曖昧さを
+避けるための `type=` トークンで指定できます。1 つの hosts ファイルにエッジと
+コントローラを混在させることもできます:
+
+```bash
+$ more host.txt
+# ip,username[,password][,type]   (type 省略時は "edge")
+2.1.1.1,admin
+3.1.1.1,admin,secret
+10.0.0.5,admin,controller
+10.0.0.6,admin,secret,vsmart
+10.0.0.7,admin,type=controller
+```
+
+各行の意味:
+
+| エントリ | 意味 |
+| --- | --- |
+| `2.1.1.1,admin` | エッジ、起動時にパスワードを1回プロンプト |
+| `3.1.1.1,admin,secret` | エッジ、パスワード埋め込み（非推奨） |
+| `10.0.0.5,admin,controller` | vBond/vSmart、起動時にプロンプト |
+| `10.0.0.6,admin,secret,vsmart` | vBond/vSmart、パスワード埋め込み |
+| `10.0.0.7,admin,type=controller` | 明示的な種別指定（`type=edge` も可） |
+
+> ホスト行に**インラインの `#` コメントは使えません**。行頭（先頭の非空白文字）が
+> `#` の行のみコメントとして扱われます。注釈はホスト行の外に書いてください。
+
+注:
+
+- `getpass` プロンプトや `--password-prompt` で入力した共通パスワードは、
+  エッジとコントローラの両方に使い回されます。資格情報が一致していれば、
+  混在した 1 回の実行で動作します。
+- パスワードが種別キーワードと一致する稀なケース（例: パスワードが
+  `controller`）では、曖昧さのない `type=` 形式、または
+  `ip,user,password,type` の 4 列形式を使ってください。
+- コントローラが慣例の TCP/22 を使わない場合のみ、`--controller-port` で
+  ポートを上書きしてください。
+
 commandファイルには実行したいshowコマンドを記載します。
 
 commandファイルの例:
@@ -337,7 +386,8 @@ python3 bulk-show.py host.txt command.txt --reject-unknown-hosts
 
 | オプション | 既定値 | 用途 |
 | --- | --- | --- |
-| `--port PORT` | `830` | 全ホストへ接続する SSH TCP ポート。SD-WAN edges (cEdge / IOS-XE SD-WAN) は vManage `vshell` が使う対話 SSH サービスを **22 ではなく 830** で公開しています。non-SD-WAN 機器を叩くときだけ 22 等に上書きしてください。 |
+| `--port PORT` | `830` | **エッジ** ホストへ接続する SSH TCP ポート。SD-WAN edges (cEdge / IOS-XE SD-WAN) は vManage `vshell` が使う対話 SSH サービスを **22 ではなく 830** で公開しています。non-SD-WAN 機器を叩くときだけ 22 等に上書きしてください。 |
+| `--controller-port PORT` | `22` | **コントローラ** (vBond / vSmart) として指定したホストへ接続する SSH TCP ポート。vManage を踏み台にすると、コントローラは慣例の 22 で viptela CLI に直接入り、パスワードは 1 回のみ・`shell` 段階はありません。 |
 | `--reject-unknown-hosts` | 無効（自動受け入れ + WARN） | `~/.ssh/known_hosts` に未登録のホスト鍵を拒否します（MITM 対策）。 |
 | `--password-prompt` | 無効 | 起動時に共通パスワードを 1 回プロンプト入力し、ファイル内の埋め込みパスワードを上書きします。 |
 | `--logs-dir LOGS_DIR` | `logs` | 出力先ディレクトリを指定します。 |
@@ -347,6 +397,8 @@ python3 bulk-show.py host.txt command.txt --reject-unknown-hosts
 | `--output-format LIST` | `text` | カンマ区切りで `text,json,csv` を組み合わせ可能。指定した形式ごとにホスト単位のファイルが追加生成されます。 |
 
 ## SD-WAN 認証に関する注意
+
+### エッジ（既定）
 
 `bulk-show.py` を vManage の `vshell` から起動する（推奨経路：`run_on_vmanage.py`）場合、
 各 SD-WAN edge への接続は **TCP/830** を使い、デバイス側でパスワードを **2 回**
@@ -364,6 +416,18 @@ python3 bulk-show.py host.txt command.txt --reject-unknown-hosts
 同じパスワードを使ってください**。現状、トランスポート層とシェル層で異なる
 資格情報を使い分ける機能はありません。
 
+### コントローラ (vBond / vSmart)
+
+コントローラとして指定したホスト（[コントローラを対象にする](#コントローラ-vbond--vsmart-を対象にする)参照）は
+挙動が異なります。vManage を踏み台にすると、コントローラは **TCP/22** で接続され、
+viptela CLI に直接入ります:
+
+1. **SSH トランスポート層** — SSH ハンドシェイク時にパスワードを送信します。
+   これが **唯一** のパスワード入力で、`shell` サブプロセスは無く、2 回目の
+   `Password:` プロンプトも発生しません。
+2. **ページング** — show コマンド実行前に、IOS-XE の `terminal length 0` ではなく
+   viptela CLI の `paginate false` を送信します。
+
 実行例（新オプション）:
 
 ```bash
@@ -372,6 +436,10 @@ python3 bulk-show.py host.txt command.txt --max-workers 4
 
 # SSH ポートを上書き（SD-WAN 以外の機器に対し、慣例の 22 を使う場合のみ）
 python3 bulk-show.py host.txt command.txt --port 22
+
+# エッジとコントローラを host.txt に混在（コントローラは種別トークンで指定）。
+# コントローラは既定で TCP/22 を使用。必要ならポートを上書き。
+python3 bulk-show.py host.txt command.txt --controller-port 22
 
 # 一過性失敗を 3 回まで 10 秒間隔でリトライ（auth failure はリトライ対象外）
 python3 bulk-show.py host.txt command.txt --retries 3 --retry-delay 10

@@ -1,4 +1,3 @@
-import paramiko
 import argparse
 import sys
 import time
@@ -22,6 +21,19 @@ DEFAULT_PROMPT_RE = re.compile(r"(?:^|\n)\S+[#>]\s*\Z")
 # Matches a "Password:" re-authentication prompt at the tail of the buffer.
 PASSWORD_PROMPT_RE = re.compile(r"password:\s*\Z", re.IGNORECASE)
 
+# Matches ANSI / VT100 escape sequences: CSI sequences such as "\x1b[?7h"
+# (DEC autowrap), "\x1b[0m" (SGR), and simple two-character escapes. The
+# viptela CLI on vBond / vSmart emits a line-wrap escape ("\x1b[?7h")
+# immediately before its command prompt; left in place it gets captured as
+# part of the prompt (e.g. "\x1b[?7hvsmart#") and breaks prompt detection on
+# every subsequent command. Stripping these also keeps the saved logs clean.
+ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def strip_ansi(text):
+    """Remove ANSI / VT100 escape sequences from ``text``."""
+    return ANSI_ESCAPE_RE.sub("", text)
+
 # Patterns indicating shell-level password authentication failure.
 # Matched case-insensitively against the buffer received after sending
 # a password to the device's "shell" sub-process.
@@ -32,6 +44,17 @@ AUTH_FAILURE_RE = re.compile(
     r"%\s*Bad\s+password|"
     r"permission\s+denied|"
     r"too\s+many\s+authentication\s+failures)",
+    re.IGNORECASE,
+)
+
+# Controllers (vBond / vSmart) use a single password supplied during the SSH
+# handshake and never enter a "shell" sub-process. So any tail that asks for a
+# password again, or reports an auth failure, means the login did NOT settle
+# into the viptela CLI. Combine both signals into one expect pattern for the
+# controller's initial read so we can fail clearly instead of sending show
+# commands into a password prompt and falsely reporting success.
+CONTROLLER_REAUTH_RE = re.compile(
+    r"(?:" + PASSWORD_PROMPT_RE.pattern + r")|(?:" + AUTH_FAILURE_RE.pattern + r")",
     re.IGNORECASE,
 )
 
@@ -62,6 +85,158 @@ SESSION_OTHER_ERR = "error"
 # Per-command status codes (recorded in command_result["status"]).
 CMD_OK = "ok"
 CMD_TIMEOUT = "timeout"
+
+# ---------------------------------------------------------------------------
+# Device types / connection profiles
+# ---------------------------------------------------------------------------
+#
+# Two connection profiles are supported:
+#
+#   edge       (default) Cisco SD-WAN edges (cEdge / IOS-XE SD-WAN). Reached
+#              on TCP/830, enter the device "shell" sub-process which may
+#              re-prompt for the SAME password a second time, then run
+#              IOS-XE style commands (pagination off via 'terminal length 0').
+#
+#   controller vBond / vSmart (and vManage). When reached through vManage
+#              acting as a jump server, the SSH transport drops you straight
+#              into the viptela CLI on the conventional TCP/22 -- there is no
+#              'shell' sub-process and the password is asked only ONCE.
+#              Pagination is disabled with the viptela 'paginate false'.
+DEVICE_EDGE = "edge"
+DEVICE_CONTROLLER = "controller"
+
+# User-facing aliases accepted in the hosts file (case-insensitive), mapped to
+# the canonical device type above.
+DEVICE_TYPE_ALIASES = {
+    "edge": DEVICE_EDGE,
+    "cedge": DEVICE_EDGE,
+    "controller": DEVICE_CONTROLLER,
+    "ctrl": DEVICE_CONTROLLER,
+    "vsmart": DEVICE_CONTROLLER,
+    "vbond": DEVICE_CONTROLLER,
+    "vmanage": DEVICE_CONTROLLER,
+}
+
+
+def normalize_device_type(token):
+    """Map a user-supplied device-type token to a canonical type or None.
+
+    Comparison is case-insensitive and surrounding whitespace is ignored.
+    Returns ``DEVICE_EDGE`` / ``DEVICE_CONTROLLER`` or ``None`` if the token
+    is not a recognized alias.
+    """
+    if token is None:
+        return None
+    return DEVICE_TYPE_ALIASES.get(token.strip().lower())
+
+
+def parse_host_line(line):
+    """Parse one hosts-file line into ``(ip, username, password, device_type)``.
+
+    Returns ``None`` for blank lines and comment lines (first non-space char
+    ``#``). Raises :class:`ValueError` with a human-readable reason for
+    malformed lines so the caller can print it and skip the host.
+
+    Supported comma-separated forms (whitespace around fields is stripped)::
+
+        ip,user                         -> edge,       password prompted later
+        ip,user,password                -> edge,       password embedded
+        ip,user,controller              -> controller, password prompted later
+        ip,user,password,controller     -> controller, password embedded
+        ip,user,type=controller         -> controller, password prompted later
+        ip,user,password,type=controller-> controller, password embedded
+
+    The device type may be given either as an explicit ``type=<value>`` token
+    (recommended; unambiguous, allowed anywhere after the IP) or as a bare
+    keyword alias (``edge``/``controller``/``vsmart``/``vbond``/...). When the
+    bare-keyword form is used, a password whose literal value collides with a
+    type alias would be misread; use the ``type=`` form (or the 4-column form)
+    in that rare case.
+
+    ``device_type`` defaults to :data:`DEVICE_EDGE` when not specified.
+    """
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+
+    parts = [p.strip() for p in stripped.split(",")]
+
+    # First pass: pull out any explicit ``type=<value>`` token(s). These are
+    # unambiguous, so they win over a trailing bare keyword.
+    device_type = None
+    positional = []
+    for field in parts:
+        if field.lower().startswith("type="):
+            value = field.split("=", 1)[1]
+            mapped = normalize_device_type(value)
+            if mapped is None:
+                raise ValueError(
+                    f"unknown device type {value!r} "
+                    f"(valid: {', '.join(sorted(set(DEVICE_TYPE_ALIASES)))})"
+                )
+            # Reject contradictory explicit types (e.g. type=edge,type=vsmart).
+            # Repeating the SAME canonical type is harmless and allowed.
+            if device_type is not None and device_type != mapped:
+                raise ValueError(
+                    f"conflicting device types {device_type!r} and {mapped!r}"
+                )
+            device_type = mapped
+        else:
+            positional.append(field)
+
+    if len(positional) < 2:
+        raise ValueError(
+            "expected at least 'ip,user' "
+            "(optionally ',password' and/or a device type)"
+        )
+
+    router_ip = positional[0]
+    username = positional[1]
+    password = None
+
+    extras = positional[2:]
+    if device_type is None and extras:
+        # The last positional field may be a bare device-type keyword. Only
+        # consume it as a type when it actually maps to one; otherwise it is
+        # treated as (part of) the password column.
+        mapped_last = normalize_device_type(extras[-1])
+        if mapped_last is not None:
+            if len(extras) == 1:
+                # Ambiguous 3-column form "ip,user,<keyword>": the trailing
+                # field doubles as both a possible password and a device-type
+                # alias. We keep the legacy behavior (treat it as a device
+                # type, dropping it from the password column) but make the
+                # inference explicit so a real password that happens to collide
+                # with an alias is not silently swallowed.
+                print(
+                    f"[WARN] host '{router_ip}': treating '{extras[-1]}' as "
+                    f"device type '{mapped_last}' (password left empty); if "
+                    f"'{extras[-1]}' was meant to be a password, use the "
+                    f"'type=' form (e.g. "
+                    f"'{router_ip},{username},{extras[-1]},type=edge') or the "
+                    f"'ip,user,password,type' layout",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            device_type = mapped_last
+            extras = extras[:-1]
+
+    if len(extras) > 1:
+        raise ValueError(
+            "too many fields; expected 'ip,user[,password][,type]'"
+        )
+    if extras:
+        password = extras[0] or None
+
+    if device_type is None:
+        device_type = DEVICE_EDGE
+
+    if not router_ip:
+        raise ValueError("missing IP address")
+    if not username:
+        raise ValueError("missing username")
+
+    return router_ip, username, password, device_type
 
 # Boundary markers used in text output. They are designed to be easy to grep
 # (`^=====`) and to carry enough metadata for downstream tooling.
@@ -131,12 +306,12 @@ def read_channel(
     while True:
         now = time.monotonic()
         if now - start >= max_wait:
-            return "".join(chunks), MATCH_MAX_WAIT
+            return strip_ansi("".join(chunks)), MATCH_MAX_WAIT
         try:
             data = channel.recv(4096)
             if not data:
                 # EOF on the channel.
-                return "".join(chunks), MATCH_EOF
+                return strip_ansi("".join(chunks)), MATCH_EOF
             chunks.append(data.decode(errors="replace"))
             last_data = now
         except socket.timeout:
@@ -144,20 +319,22 @@ def read_channel(
             pass
         except OSError:
             # Other socket-level errors are treated as EOF for our purposes.
-            return "".join(chunks), MATCH_EOF
+            return strip_ansi("".join(chunks)), MATCH_EOF
 
         # Check matches whether we received data this poll or not, so that
-        # idle exits still get a final chance to confirm the tail.
-        tail = "".join(chunks)[-1024:]
+        # idle exits still get a final chance to confirm the tail. Strip ANSI
+        # escapes first so embedded sequences (e.g. the viptela "\x1b[?7h"
+        # emitted before the prompt) do not defeat the prompt/expect regexes.
+        tail = strip_ansi("".join(chunks))[-1024:]
         if expect_re is not None and expect_re.search(tail):
-            return "".join(chunks), MATCH_EXPECT
+            return strip_ansi("".join(chunks)), MATCH_EXPECT
         if prompt_re is not None and prompt_re.search(tail):
-            return "".join(chunks), MATCH_PROMPT
+            return strip_ansi("".join(chunks)), MATCH_PROMPT
 
         # Idle exit: at least some data has been received and nothing new
         # has arrived for idle_timeout seconds.
         if chunks and now - last_data >= idle_timeout:
-            return "".join(chunks), MATCH_IDLE
+            return strip_ansi("".join(chunks)), MATCH_IDLE
 
 
 def extract_prompt(buffer):
@@ -167,6 +344,7 @@ def extract_prompt(buffer):
     Returns the captured prompt string (e.g. "host_2111#") or None
     if no usable prompt is detected on the last non-empty line.
     """
+    buffer = strip_ansi(buffer)
     for line in reversed(buffer.splitlines()):
         line = line.rstrip()
         if not line:
@@ -326,6 +504,7 @@ def connect_and_execute(
     port=830,
     retries=0,
     retry_delay=5.0,
+    device_type=DEVICE_EDGE,
 ):
     """
     Connect to a single host, run the user's commands, and write per-host
@@ -347,11 +526,17 @@ def connect_and_execute(
             one fails on a transient network/SSH error (Issue 12). Auth
             failures are NEVER retried because they will not fix themselves.
         retry_delay: seconds to sleep between connect attempts.
+        device_type: connection profile, one of DEVICE_EDGE (default) or
+            DEVICE_CONTROLLER. Edges enter the device "shell" sub-process
+            (and may re-prompt for the password a second time); controllers
+            (vBond/vSmart reached through vManage) land directly in the
+            viptela CLI with a single password and no "shell" step.
 
     Returns:
         session_result: dict with the schema:
             {
               "host": str, "username": str, "port": int,
+              "device_type": str,
               "started_at": iso, "ended_at": iso, "duration_s": float,
               "status": one of SESSION_*,
               "error": str | None,
@@ -363,12 +548,17 @@ def connect_and_execute(
               ],
             }
     """
+    # Imported lazily so that the pure-parser helpers in this module remain
+    # importable (and unit-testable) on systems without paramiko installed.
+    import paramiko
+
     started_wall = now_iso()
     started_mono = time.monotonic()
     session_result = {
         "host": router_ip,
         "username": username,
         "port": port,
+        "device_type": device_type,
         "started_at": started_wall,
         "ended_at": started_wall,  # updated in finally
         "duration_s": 0.0,
@@ -424,84 +614,156 @@ def connect_and_execute(
                 return session_result
         log_message(f"[{router_ip}] connected")
 
-        # Phase 2: Open an interactive shell and enter the device "shell"
-        # sub-process. Wait for either a re-auth password prompt or the
-        # device's command prompt -- whichever comes first.
+        # Phase 2: Open an interactive shell and settle on a usable command
+        # prompt. Edges and controllers differ here, so branch on the
+        # connection profile.
         shell = ssh.invoke_shell()
-        shell.send("shell\n")
-        log_message(f"[{router_ip}] entered shell")
 
-        buf, kind = read_channel(
-            shell,
-            prompt_re=DEFAULT_PROMPT_RE,
-            expect_re=PASSWORD_PROMPT_RE,
-            idle_timeout=1.0,
-            max_wait=10.0,
-        )
-        auth_banner.append(buf)
-
-        if kind == MATCH_EXPECT:
-            # Re-authentication requested by the device.
-            shell.send(f"{password}\n")
+        if device_type == DEVICE_CONTROLLER:
+            # Controllers (vBond / vSmart) reached through vManage land us
+            # directly in the viptela CLI on the SSH transport: there is no
+            # "shell" sub-process and the password was already supplied during
+            # the SSH handshake (asked only once). Just wait for the CLI
+            # prompt to appear.
             buf, kind = read_channel(
                 shell,
                 prompt_re=DEFAULT_PROMPT_RE,
-                expect_re=AUTH_FAILURE_RE,
+                expect_re=CONTROLLER_REAUTH_RE,
                 idle_timeout=1.0,
                 max_wait=10.0,
             )
             auth_banner.append(buf)
             if kind == MATCH_EXPECT:
+                # The controller unexpectedly asked for a password again (or
+                # reported an auth failure). The controller profile assumes a
+                # single password was already supplied during the SSH
+                # handshake, so we deliberately do NOT resend it here: doing so
+                # could leak the password into command output and would mask the
+                # real problem. Fail clearly instead.
+                if AUTH_FAILURE_RE.search(buf):
+                    session_result["error"] = (
+                        "auth error (shell): controller rejected the password"
+                    )
+                else:
+                    session_result["error"] = (
+                        "auth error (shell): controller re-prompted for a "
+                        "password (single-password profile does not resend); "
+                        "aborting"
+                    )
                 session_result["status"] = SESSION_AUTH_SHELL
-                session_result["error"] = (
-                    "auth error (shell): device rejected the password"
-                )
                 log_message(f"[{router_ip}] {session_result['error']}")
                 return session_result
             if kind != MATCH_PROMPT:
-                session_result["status"] = SESSION_SHELL_ERR
-                session_result["error"] = (
-                    f"shell did not return a prompt after password "
-                    f"(got {kind}); aborting"
+                # A long login banner may push the prompt past the window;
+                # warn but continue and rely on per-command max_wait.
+                log_message(
+                    f"[{router_ip}] warning: no CLI prompt after login "
+                    f"({kind}); proceeding anyway"
                 )
-                log_message(f"[{router_ip}] {session_result['error']}")
-                return session_result
-        elif kind != MATCH_PROMPT:
-            # Neither a prompt nor a password request appeared in the
-            # initial window. Some platforms emit a long banner first;
-            # we log a warning but continue and rely on the per-command
-            # max_wait to recover.
-            log_message(
-                f"[{router_ip}] warning: shell entry returned no prompt "
-                f"({kind}); proceeding anyway"
-            )
 
-        # Phase 3: Capture the device's prompt for accurate completion
-        # detection. Fall back to the default regex if extraction fails.
-        captured_prompt = extract_prompt("".join(auth_banner))
-        cmd_prompt_re = build_command_prompt_re(captured_prompt)
-        if captured_prompt:
-            log_message(f"[{router_ip}] prompt: {captured_prompt}")
+            # Phase 3: Capture the device's prompt for accurate completion
+            # detection. Fall back to the default regex if extraction fails.
+            captured_prompt = extract_prompt("".join(auth_banner))
+            cmd_prompt_re = build_command_prompt_re(captured_prompt)
+            if captured_prompt:
+                log_message(f"[{router_ip}] prompt: {captured_prompt}")
+            else:
+                log_message(
+                    f"[{router_ip}] prompt: <not captured, using default regex>"
+                )
+
+            # Phase 4: Disable pagination in the viptela CLI.
+            shell.send("paginate false\n")
+            _, page_kind = read_channel(
+                shell,
+                prompt_re=cmd_prompt_re,
+                idle_timeout=1.0,
+                max_wait=5.0,
+            )
+            if page_kind != MATCH_PROMPT:
+                log_message(
+                    f"[{router_ip}] warning: 'paginate false' did not "
+                    f"return a prompt ({page_kind}); first command output may "
+                    "include residual data"
+                )
         else:
-            log_message(
-                f"[{router_ip}] prompt: <not captured, using default regex>"
-            )
+            # Edge profile: enter the device "shell" sub-process. Wait for
+            # either a re-auth password prompt or the device's command prompt
+            # -- whichever comes first.
+            shell.send("shell\n")
+            log_message(f"[{router_ip}] entered shell")
 
-        # Phase 4: Disable pagination. Wait for the captured prompt to
-        # ensure the shell is settled before user commands start.
-        shell.send("terminal length 0\n")
-        _, term_kind = read_channel(
-            shell,
-            prompt_re=cmd_prompt_re,
-            idle_timeout=1.0,
-            max_wait=5.0,
-        )
-        if term_kind != MATCH_PROMPT:
-            log_message(
-                f"[{router_ip}] warning: 'terminal length 0' did not "
-                f"return a prompt ({term_kind}); first command output may "
-                "include residual data"
+            buf, kind = read_channel(
+                shell,
+                prompt_re=DEFAULT_PROMPT_RE,
+                expect_re=PASSWORD_PROMPT_RE,
+                idle_timeout=1.0,
+                max_wait=10.0,
             )
+            auth_banner.append(buf)
+
+            if kind == MATCH_EXPECT:
+                # Re-authentication requested by the device.
+                shell.send(f"{password}\n")
+                buf, kind = read_channel(
+                    shell,
+                    prompt_re=DEFAULT_PROMPT_RE,
+                    expect_re=AUTH_FAILURE_RE,
+                    idle_timeout=1.0,
+                    max_wait=10.0,
+                )
+                auth_banner.append(buf)
+                if kind == MATCH_EXPECT:
+                    session_result["status"] = SESSION_AUTH_SHELL
+                    session_result["error"] = (
+                        "auth error (shell): device rejected the password"
+                    )
+                    log_message(f"[{router_ip}] {session_result['error']}")
+                    return session_result
+                if kind != MATCH_PROMPT:
+                    session_result["status"] = SESSION_SHELL_ERR
+                    session_result["error"] = (
+                        f"shell did not return a prompt after password "
+                        f"(got {kind}); aborting"
+                    )
+                    log_message(f"[{router_ip}] {session_result['error']}")
+                    return session_result
+            elif kind != MATCH_PROMPT:
+                # Neither a prompt nor a password request appeared in the
+                # initial window. Some platforms emit a long banner first;
+                # we log a warning but continue and rely on the per-command
+                # max_wait to recover.
+                log_message(
+                    f"[{router_ip}] warning: shell entry returned no prompt "
+                    f"({kind}); proceeding anyway"
+                )
+
+            # Phase 3: Capture the device's prompt for accurate completion
+            # detection. Fall back to the default regex if extraction fails.
+            captured_prompt = extract_prompt("".join(auth_banner))
+            cmd_prompt_re = build_command_prompt_re(captured_prompt)
+            if captured_prompt:
+                log_message(f"[{router_ip}] prompt: {captured_prompt}")
+            else:
+                log_message(
+                    f"[{router_ip}] prompt: <not captured, using default regex>"
+                )
+
+            # Phase 4: Disable pagination. Wait for the captured prompt to
+            # ensure the shell is settled before user commands start.
+            shell.send("terminal length 0\n")
+            _, term_kind = read_channel(
+                shell,
+                prompt_re=cmd_prompt_re,
+                idle_timeout=1.0,
+                max_wait=5.0,
+            )
+            if term_kind != MATCH_PROMPT:
+                log_message(
+                    f"[{router_ip}] warning: 'terminal length 0' did not "
+                    f"return a prompt ({term_kind}); first command output may "
+                    "include residual data"
+                )
 
         # Phase 5: Run the user's commands. Each command captures its own
         # metadata (start time, duration, exit kind) so that downstream
@@ -613,17 +875,27 @@ if __name__ == "__main__":
             "    python3 bulk-show.py hosts.txt commands.txt --retries 3 --retry-delay 10\n"
             "  Emit text + JSON + CSV outputs per host:\n"
             "    python3 bulk-show.py hosts.txt commands.txt --output-format text,json,csv\n"
+            "  Mix edges and controllers (vBond/vSmart) in one hosts file:\n"
+            "    python3 bulk-show.py hosts.txt commands.txt\n"
             "\n"
             "Hosts file format: one host per line, comma-separated.\n"
-            "  Two columns:   ip,username           (password prompted at startup)\n"
-            "  Three columns: ip,username,password  (password embedded; not recommended)\n"
+            "  ip,username                       edge,  password prompted at startup\n"
+            "  ip,username,password              edge,  password embedded (not recommended)\n"
+            "  ip,username,controller            controller, password prompted at startup\n"
+            "  ip,username,password,controller   controller, password embedded\n"
+            "  ip,username,type=controller       explicit device type (also: type=edge)\n"
+            "Device type defaults to 'edge'. Controllers connect on --controller-port\n"
+            "(default 22) with a single password and no 'shell' step; edges connect on\n"
+            "--port (default 830) and may re-prompt for the password inside 'shell'.\n"
             "Lines starting with '#' and blank lines are ignored.\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "hosts_file",
-        help="File listing hosts. Each line: 'ip,username' or 'ip,username,password'.",
+        help="File listing hosts. Each line: 'ip,username[,password]' with an "
+             "optional device type ('controller'/'vsmart'/'vbond' or "
+             "'type=controller'); defaults to edge.",
     )
     parser.add_argument("commands_file", help="The file containing the list of commands")
     parser.add_argument(
@@ -635,6 +907,19 @@ if __name__ == "__main__":
             "Cisco SD-WAN edges expose the interactive SSH service used by "
             "vManage vshell on 830; override only when targeting "
             "non-SD-WAN devices that use the conventional 22."
+        ),
+    )
+    parser.add_argument(
+        "--controller-port",
+        type=int,
+        default=22,
+        help=(
+            "SSH TCP port for hosts marked as controllers (default: 22). "
+            "vBond / vSmart reached through vManage land directly in the "
+            "viptela CLI on the conventional port 22 with a single password "
+            "(no 'shell' step). Mark a host as a controller in the hosts "
+            "file with a 'type=controller' token or a bare keyword "
+            "(controller/vsmart/vbond)."
         ),
     )
     parser.add_argument(
@@ -690,6 +975,13 @@ if __name__ == "__main__":
             file=sys.stderr,
         )
         sys.exit(2)
+    if args.controller_port < 1 or args.controller_port > 65535:
+        print(
+            f"--controller-port must be between 1 and 65535 "
+            f"(got {args.controller_port})",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     if args.max_workers is not None and args.max_workers < 1:
         print(
             f"--max-workers must be >= 1 (got {args.max_workers})",
@@ -720,41 +1012,36 @@ if __name__ == "__main__":
         )
 
     # Read hosts file and parse entries.
-    # Supported formats per non-empty/non-comment line:
-    #   "ip,user"           -> password supplied later (shared prompt)
-    #   "ip,user,password"  -> password embedded in file (legacy)
+    # Supported formats per non-empty/non-comment line (see parse_host_line):
+    #   "ip,user"                        -> edge,       shared prompt
+    #   "ip,user,password"               -> edge,       embedded (legacy)
+    #   "ip,user[,password],controller"  -> controller  (bare keyword)
+    #   "ip,user[,password],type=...."   -> explicit device type
     with open(args.hosts_file, "r") as hosts_file:
         host_lines = hosts_file.readlines()
 
-    parsed_hosts = []  # list of tuples: (router_ip, username, password_or_None)
+    # list of tuples: (router_ip, username, password_or_None, device_type)
+    parsed_hosts = []
     needs_shared_password = False
 
     for line in host_lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+        try:
+            parsed = parse_host_line(line)
+        except ValueError as exc:
+            print(f"Invalid host entry: {line.strip()}. {exc}. Skipping.")
             continue
-        parts = [p.strip() for p in stripped.split(",")]
-        if len(parts) == 2:
-            router_ip, username = parts
-            password = None
-            needs_shared_password = True
-        elif len(parts) == 3:
-            router_ip, username, password = parts
-        else:
-            print(
-                f"Invalid host entry: {line.strip()}. "
-                "Expected 'ip,user' or 'ip,user,password'. Skipping."
-            )
+        if parsed is None:
             continue
+        router_ip, username, password, device_type = parsed
 
         if not is_valid_ip(router_ip):
             print(f"Invalid IP address: {router_ip}. Skipping this host.")
             continue
-        if not username:
-            print(f"Missing username for host {router_ip}. Skipping.")
-            continue
 
-        parsed_hosts.append((router_ip, username, password))
+        if password is None:
+            needs_shared_password = True
+
+        parsed_hosts.append((router_ip, username, password, device_type))
 
     if not parsed_hosts:
         print("No valid hosts found. Aborting.", file=sys.stderr)
@@ -796,7 +1083,7 @@ if __name__ == "__main__":
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
-        for router_ip, username, password in parsed_hosts:
+        for router_ip, username, password, device_type in parsed_hosts:
             # Choose effective password:
             #   --password-prompt -> shared overrides file
             #   missing in file   -> shared
@@ -805,6 +1092,12 @@ if __name__ == "__main__":
                 effective_password = shared_password
             else:
                 effective_password = password
+
+            # Controllers default to TCP/22; edges to --port (830).
+            if device_type == DEVICE_CONTROLLER:
+                effective_port = args.controller_port
+            else:
+                effective_port = args.port
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_paths = _build_output_paths(
@@ -818,9 +1111,10 @@ if __name__ == "__main__":
                 args.commands_file,
                 output_paths,
                 not args.reject_unknown_hosts,
-                args.port,
+                effective_port,
                 args.retries,
                 args.retry_delay,
+                device_type,
             )
             futures.append(future)
 
