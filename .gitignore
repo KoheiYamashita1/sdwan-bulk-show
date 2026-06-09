@@ -11,3 +11,4 @@ __pycache__/
 .playwright-mcp/
 webui-index.png
 amp
+.DS_Store
