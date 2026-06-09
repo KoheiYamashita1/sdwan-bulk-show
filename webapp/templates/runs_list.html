@@ -4,42 +4,210 @@
   <h1>Past runs</h1>
   <p class="lede">
     Newest first, scanned from <code>logs/</code>. Click any timestamp for the
-    per-host output files and the run manifest.
+    per-host output files and the run manifest, or tick two runs to diff a host
+    across them.
   </p>
 
   {% if runs %}
-    <table class="runs">
+    <div class="runs-toolbar">
+      <input type="search" class="runs-filter" id="runs-filter"
+             placeholder="Filter by timestamp, vManage, or status…"
+             aria-label="Filter runs">
+      <span class="progress__note" id="runs-count"></span>
+    </div>
+
+    <table class="runs" id="runs-table">
       <thead>
         <tr>
-          <th>Timestamp</th>
-          <th>vManage</th>
-          <th>Status</th>
-          <th>Outputs</th>
-          <th>Files in dir</th>
+          <th scope="col" aria-label="Select"></th>
+          <th scope="col" class="sortable" data-col="ts">Timestamp <span class="sort-ind" aria-hidden="true"></span></th>
+          <th scope="col" class="sortable" data-col="vmanage">vManage <span class="sort-ind" aria-hidden="true"></span></th>
+          <th scope="col" class="sortable" data-col="status">Status <span class="sort-ind" aria-hidden="true"></span></th>
+          <th scope="col" class="sortable" data-col="hosts">Hosts <span class="sort-ind" aria-hidden="true"></span></th>
+          <th scope="col" class="sortable" data-col="outputs">Outputs <span class="sort-ind" aria-hidden="true"></span></th>
+          <th scope="col" class="sortable" data-col="files">Files <span class="sort-ind" aria-hidden="true"></span></th>
         </tr>
       </thead>
       <tbody>
         {% for run in runs %}
-          <tr>
-            <td><a href="/runs/{{ run.timestamp }}"><code>{{ run.timestamp }}</code></a></td>
-            <td>{{ run.vmanage_host or "—" }}</td>
-            <td>
+          {% set m = run.manifest %}
+          <tr data-ts="{{ run.timestamp }}"
+              data-vmanage="{{ run.vmanage_host|lower }}"
+              data-status="{{ run.status }}"
+              data-hosts="{{ (m.hosts_ok|default(0)) + (m.hosts_failed|default(0)) if m else 0 }}"
+              data-outputs="{{ m.outputs_count if m else 0 }}"
+              data-files="{{ run.file_count }}">
+            <td data-label="Pick">
+              <input type="checkbox" class="runs__pick" value="{{ run.timestamp }}"
+                     aria-label="Select {{ run.timestamp }} for cross-run compare">
+            </td>
+            <td data-label="Timestamp">
+              <a href="/runs/{{ run.timestamp }}">
+                <time class="tnum run-time" data-ts="{{ run.timestamp }}"><code>{{ run.timestamp }}</code></time>
+              </a>
+            </td>
+            <td data-label="vManage">{{ run.vmanage_host or "—" }}</td>
+            <td data-label="Status">
               <span class="status status--{{ run.status }}">{{ run.status }}</span>
               {% if run.returncode is not none %}
-                <small>(rc={{ run.returncode }})</small>
+                <small class="tnum">(rc={{ run.returncode }})</small>
               {% endif %}
             </td>
-            <td>
-              {% if run.manifest %}
-                {{ run.manifest.outputs_count }}
+            <td data-label="Hosts">
+              {% if m and (m.hosts_ok is defined or m.hosts_failed is defined) %}
+                <span class="hostcount">
+                  <span class="hostcount__ok" title="hosts ok">{{ m.hosts_ok|default(0) }}✓</span>
+                  {% if m.hosts_failed|default(0) %}
+                    <span class="hostcount__fail" title="hosts failed">{{ m.hosts_failed }}✗</span>
+                  {% endif %}
+                </span>
               {% else %}—{% endif %}
             </td>
-            <td>{{ run.file_count }}</td>
+            <td data-label="Outputs">{% if m %}{{ m.outputs_count }}{% else %}—{% endif %}</td>
+            <td data-label="Files">{{ run.file_count }}</td>
           </tr>
         {% endfor %}
       </tbody>
     </table>
+
+    <div class="compare-cta" id="compare-cta" hidden>
+      <span class="compare-cta__hint" id="compare-cta-hint">Pick two runs to compare a host across them.</span>
+      <a href="#" class="button" id="compare-cta-go" hidden>Compare across runs →</a>
+    </div>
   {% else %}
     <p class="empty">No runs yet. Submit the form on the <a href="/">Run page</a>.</p>
   {% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if runs %}
+<script>
+  (function () {
+    "use strict";
+
+    var table = document.getElementById("runs-table");
+    var tbody = table ? table.querySelector("tbody") : null;
+    var filter = document.getElementById("runs-filter");
+    var countEl = document.getElementById("runs-count");
+    if (!table || !tbody) {
+      return;
+    }
+    var rows = Array.prototype.slice.call(tbody.querySelectorAll("tr"));
+
+    // Humanize timestamps: YYYYMMDD_HHMMSS -> relative + absolute.
+    function parseTs(ts) {
+      var m = /^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})$/.exec(ts);
+      if (!m) {
+        return null;
+      }
+      return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+    }
+    function relative(date) {
+      var diff = (Date.now() - date.getTime()) / 1000;
+      var abs = Math.abs(diff);
+      var units = [
+        [31536000, "y"], [2592000, "mo"], [86400, "d"],
+        [3600, "h"], [60, "m"], [1, "s"],
+      ];
+      for (var i = 0; i < units.length; i += 1) {
+        if (abs >= units[i][0] || units[i][1] === "s") {
+          var n = Math.floor(abs / units[i][0]);
+          return diff >= 0 ? n + units[i][1] + " ago" : "in " + n + units[i][1];
+        }
+      }
+      return "";
+    }
+    rows.forEach(function (tr) {
+      var t = tr.querySelector(".run-time");
+      if (!t) { return; }
+      var d = parseTs(t.getAttribute("data-ts"));
+      if (!d) { return; }
+      t.setAttribute("datetime", d.toISOString());
+      t.title = d.toLocaleString();
+      var rel = document.createElement("small");
+      rel.className = "progress__note";
+      rel.textContent = " · " + relative(d);
+      t.parentNode.appendChild(rel);
+    });
+
+    // Live filter.
+    function applyFilter() {
+      var q = (filter && filter.value || "").trim().toLowerCase();
+      var shown = 0;
+      rows.forEach(function (tr) {
+        var hay = [
+          tr.getAttribute("data-ts"),
+          tr.getAttribute("data-vmanage"),
+          tr.getAttribute("data-status"),
+        ].join(" ").toLowerCase();
+        var match = !q || hay.indexOf(q) >= 0;
+        tr.style.display = match ? "" : "none";
+        if (match) { shown += 1; }
+      });
+      if (countEl) {
+        countEl.textContent = shown + " / " + rows.length + " runs";
+      }
+    }
+    if (filter) {
+      filter.addEventListener("input", applyFilter);
+    }
+    applyFilter();
+
+    // Sortable columns.
+    var sortState = { col: null, dir: 1 };
+    function cmp(a, b, col) {
+      var av = a.getAttribute("data-" + col) || "";
+      var bv = b.getAttribute("data-" + col) || "";
+      if (col === "hosts" || col === "outputs" || col === "files") {
+        return (+av || 0) - (+bv || 0);
+      }
+      return av < bv ? -1 : av > bv ? 1 : 0;
+    }
+    table.querySelectorAll("th.sortable").forEach(function (th) {
+      th.addEventListener("click", function () {
+        var col = th.getAttribute("data-col");
+        sortState.dir = sortState.col === col ? -sortState.dir : 1;
+        sortState.col = col;
+        rows.sort(function (a, b) { return cmp(a, b, col) * sortState.dir; });
+        rows.forEach(function (tr) { tbody.appendChild(tr); });
+        table.querySelectorAll(".sort-ind").forEach(function (s) { s.textContent = ""; });
+        var ind = th.querySelector(".sort-ind");
+        if (ind) { ind.textContent = sortState.dir > 0 ? "▲" : "▼"; }
+      });
+    });
+
+    // Cross-run pick-two.
+    var picks = Array.prototype.slice.call(table.querySelectorAll(".runs__pick"));
+    var cta = document.getElementById("compare-cta");
+    var ctaGo = document.getElementById("compare-cta-go");
+    var ctaHint = document.getElementById("compare-cta-hint");
+    function selected() {
+      return picks.filter(function (p) { return p.checked; });
+    }
+    function onPick() {
+      var sel = selected();
+      picks.forEach(function (p) {
+        p.disabled = sel.length >= 2 && !p.checked;
+        var tr = p.closest("tr");
+        if (tr) { tr.classList.toggle("is-selected", p.checked); }
+      });
+      if (cta) { cta.hidden = sel.length === 0; }
+      if (sel.length === 2) {
+        var a = sel[0].value;
+        var b = sel[1].value;
+        if (ctaGo) {
+          ctaGo.hidden = false;
+          ctaGo.href = "/runs/compare-across?a=" + encodeURIComponent(a) +
+            "&b=" + encodeURIComponent(b);
+        }
+        if (ctaHint) { ctaHint.textContent = a + "  ↔  " + b; }
+      } else {
+        if (ctaGo) { ctaGo.hidden = true; }
+        if (ctaHint) { ctaHint.textContent = "Pick two runs to compare a host across them."; }
+      }
+    }
+    picks.forEach(function (p) { p.addEventListener("change", onPick); });
+  })();
+</script>
+{% endif %}
 {% endblock %}

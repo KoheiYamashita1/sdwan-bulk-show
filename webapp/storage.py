@@ -32,6 +32,29 @@ TIMESTAMP_RE = re.compile(r"^\d{8}_\d{6}$")
 # (the largest realistic ``show ip route`` capture sits well under this).
 MAX_VIEW_BYTES = 5 * 1024 * 1024
 
+# Hard cap on a request-supplied filename length (A3). Real output names are
+# well under this; anything longer is a probe and refused before touching the
+# filesystem.
+MAX_FILENAME_LEN = 255
+
+# Caps for the intra-line word-level diff segments (C4) so a pathological pair
+# of very long lines cannot turn the diff into a CPU sink. Lines longer than
+# ``MAX_SEGMENT_LINE_LEN`` (either side) skip segmentation, and at most
+# ``MAX_SEGMENT_ROWS`` replace-rows get segments.
+MAX_SEGMENT_LINE_LEN = 2000
+MAX_SEGMENT_ROWS = 2000
+
+# A real per-host output file is ``output_<ip>_<innerts>.<ext>`` where the
+# inner timestamp is bulk-show.py's ``%Y%m%d_%H%M%S`` (C2).
+_OUTPUT_HOST_RE = re.compile(
+    r"^output_(?P<host>.+?)_\d{8}_\d{6}\.(?:txt|json|csv)$"
+)
+
+# A request-supplied host token must look like an IPv4 address or hostname so
+# it can be safely used as a filename prefix (file resolution still goes
+# through safe_file_path).
+_HOST_TOKEN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?$")
+
 
 class StorageError(Exception):
     """Raised when a request resolves outside the ``logs/`` sandbox."""
@@ -143,6 +166,10 @@ def safe_file_path(timestamp: str, filename: str) -> Path:
 
     if not filename:
         raise StorageError("filename is required")
+    if len(filename) > MAX_FILENAME_LEN:
+        raise StorageError(
+            f"filename exceeds the {MAX_FILENAME_LEN}-char cap"
+        )
     # Filenames coming from the URL are kept syntactic only; we explicitly
     # forbid path separators and parent-dir refs before touching the FS.
     if "/" in filename or "\\" in filename or filename in {".", ".."}:
@@ -202,15 +229,59 @@ def build_unified_diff(
             a_lines, b_lines, fromfile=a_name, tofile=b_name, lineterm=""
         )
     )
+    rows = build_side_by_side(a_lines, b_lines)
     return {
         "a": a_name,
         "b": b_name,
         "a_truncated": bool(a_truncated),
         "b_truncated": bool(b_truncated),
         "diff": diff,
-        "rows": build_side_by_side(a_lines, b_lines),
+        "rows": rows,
+        "stats": _diff_stats(rows),
         "identical": not diff,
     }
+
+
+def _diff_stats(rows: list[dict]) -> dict:
+    """Summarise side-by-side ``rows`` into add/remove/change/unchanged counts.
+
+    Additive field consumed by the Wave 2 diff UI; the ``rows`` shape itself
+    is unchanged.
+    """
+
+    stats = {"added": 0, "removed": 0, "changed": 0, "unchanged": 0}
+    for row in rows:
+        tag = row.get("tag")
+        if tag == "insert":
+            stats["added"] += 1
+        elif tag == "delete":
+            stats["removed"] += 1
+        elif tag == "replace":
+            stats["changed"] += 1
+        elif tag == "equal":
+            stats["unchanged"] += 1
+    return stats
+
+
+def _intra_line_segments(left: str, right: str) -> tuple[list[dict], list[dict]]:
+    """Token-level diff of two strings for in-place highlighting (C4).
+
+    Returns ``(left_segments, right_segments)`` where each list holds
+    ``{"text": str, "change": bool}`` runs computed with
+    :class:`difflib.SequenceMatcher`. The client renders these with
+    ``textContent`` only, so device output can never inject markup.
+    """
+
+    matcher = difflib.SequenceMatcher(a=left, b=right, autojunk=False)
+    left_segments: list[dict] = []
+    right_segments: list[dict] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        changed = tag != "equal"
+        if i2 > i1:
+            left_segments.append({"text": left[i1:i2], "change": changed})
+        if j2 > j1:
+            right_segments.append({"text": right[j1:j2], "change": changed})
+    return left_segments, right_segments
 
 
 def build_side_by_side(a_lines: list[str], b_lines: list[str]) -> list[dict]:
@@ -230,6 +301,7 @@ def build_side_by_side(a_lines: list[str], b_lines: list[str]) -> list[dict]:
     """
 
     rows: list[dict] = []
+    segment_budget = MAX_SEGMENT_ROWS
     matcher = difflib.SequenceMatcher(a=a_lines, b=b_lines, autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
@@ -277,15 +349,31 @@ def build_side_by_side(a_lines: list[str], b_lines: list[str]) -> list[dict]:
                     row_tag = "delete"
                 else:
                     row_tag = "insert"
-                rows.append(
-                    {
-                        "tag": row_tag,
-                        "ln": i1 + k + 1 if has_left else None,
-                        "left": a_lines[i1 + k] if has_left else None,
-                        "rn": j1 + k + 1 if has_right else None,
-                        "right": b_lines[j1 + k] if has_right else None,
-                    }
-                )
+                left_text = a_lines[i1 + k] if has_left else None
+                right_text = b_lines[j1 + k] if has_right else None
+                row = {
+                    "tag": row_tag,
+                    "ln": i1 + k + 1 if has_left else None,
+                    "left": left_text,
+                    "rn": j1 + k + 1 if has_right else None,
+                    "right": right_text,
+                }
+                # Intra-line word-level segments for replaced pairs (C4),
+                # bounded so huge inputs can't blow up the diff (additive
+                # fields; the base row shape is unchanged).
+                if (
+                    row_tag == "replace"
+                    and segment_budget > 0
+                    and len(left_text) <= MAX_SEGMENT_LINE_LEN
+                    and len(right_text) <= MAX_SEGMENT_LINE_LEN
+                ):
+                    left_segs, right_segs = _intra_line_segments(
+                        left_text, right_text
+                    )
+                    row["left_segments"] = left_segs
+                    row["right_segments"] = right_segs
+                    segment_budget -= 1
+                rows.append(row)
     return rows
 
 
@@ -313,6 +401,87 @@ def diff_files(
         a_truncated=a_truncated,
         b_truncated=b_truncated,
     )
+
+
+def find_host_output(timestamp: str, host_ip: str) -> Optional[str]:
+    """Return the ``output_<host_ip>_*.txt`` filename in a run, or ``None`` (C2).
+
+    Matches by the ``output_<ip>_`` prefix (with the trailing underscore so
+    ``10.0.0.1`` does not also match ``10.0.0.10``). Real per-host filenames
+    embed an inner ``%Y%m%d_%H%M%S`` timestamp, so we return the
+    lexicographically last (newest) ``.txt`` match. Raises
+    :class:`StorageError` for an unsafe/unknown run or a malformed host token.
+    """
+
+    if not host_ip or not _HOST_TOKEN_RE.match(host_ip):
+        raise StorageError(f"invalid host: {host_ip!r}")
+    prefix = f"output_{host_ip}_"
+    matches = [
+        name
+        for name in list_run_files(timestamp)
+        if name.startswith(prefix) and name.endswith(".txt")
+    ]
+    if not matches:
+        return None
+    return sorted(matches)[-1]
+
+
+def diff_across_runs(
+    ts_a: str,
+    ts_b: str,
+    host_ip: str,
+    *,
+    max_bytes: int = MAX_VIEW_BYTES,
+) -> dict:
+    """Diff the same host's text output across two runs (C2).
+
+    Resolves the ``output_<ip>_*.txt`` file in each run via
+    :func:`find_host_output`, reads both through :func:`read_file_text` (so
+    path-traversal safety and ``MAX_VIEW_BYTES`` truncation are inherited),
+    and returns the standard :func:`build_unified_diff` payload with the
+    ``a``/``b`` labels prefixed by their run timestamp plus additive
+    ``a_run`` / ``b_run`` / ``host`` fields. Raises :class:`StorageError` when
+    the host has no output in either run.
+    """
+
+    name_a = find_host_output(ts_a, host_ip)
+    if name_a is None:
+        raise StorageError(f"no output for host {host_ip} in run {ts_a}")
+    name_b = find_host_output(ts_b, host_ip)
+    if name_b is None:
+        raise StorageError(f"no output for host {host_ip} in run {ts_b}")
+
+    a_text, a_truncated = read_file_text(ts_a, name_a, max_bytes=max_bytes)
+    b_text, b_truncated = read_file_text(ts_b, name_b, max_bytes=max_bytes)
+    payload = build_unified_diff(
+        f"{ts_a}/{name_a}",
+        a_text,
+        f"{ts_b}/{name_b}",
+        b_text,
+        a_truncated=a_truncated,
+        b_truncated=b_truncated,
+    )
+    payload["a_run"] = ts_a
+    payload["b_run"] = ts_b
+    payload["host"] = host_ip
+    return payload
+
+
+def hosts_in_run(timestamp: str) -> list[str]:
+    """Return the sorted host IPs that have an ``output_<ip>_*`` file (C2)."""
+
+    hosts: set[str] = set()
+    for name in list_run_files(timestamp):
+        match = _OUTPUT_HOST_RE.match(name)
+        if match:
+            hosts.add(match.group("host"))
+    return sorted(hosts)
+
+
+def common_hosts(ts_a: str, ts_b: str) -> list[str]:
+    """Return the sorted host IPs present in BOTH runs (C2)."""
+
+    return sorted(set(hosts_in_run(ts_a)) & set(hosts_in_run(ts_b)))
 
 
 def read_manifest(timestamp: str) -> Optional[dict]:
@@ -363,14 +532,19 @@ def _is_inside(child: Path, parent: Path) -> bool:
 
 
 __all__ = [
+    "MAX_FILENAME_LEN",
     "MAX_VIEW_BYTES",
     "RunSummary",
     "StorageError",
     "TIMESTAMP_RE",
     "build_side_by_side",
     "build_unified_diff",
+    "common_hosts",
+    "diff_across_runs",
     "diff_files",
+    "find_host_output",
     "get_run",
+    "hosts_in_run",
     "list_run_files",
     "list_runs",
     "read_file_text",

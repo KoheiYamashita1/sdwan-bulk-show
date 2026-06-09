@@ -1,7 +1,13 @@
 {% extends "base.html" %}
 {% block title %}{{ filename }} · {{ timestamp }} · sdwan-bulk-show{% endblock %}
+{% block breadcrumb %}
+  <nav class="breadcrumb" aria-label="Breadcrumb">
+    <a href="/runs">Runs</a><span class="breadcrumb__sep">/</span>
+    <a href="/runs/{{ timestamp }}"><code>{{ timestamp }}</code></a><span class="breadcrumb__sep">/</span>
+    <span><code>{{ filename }}</code></span>
+  </nav>
+{% endblock %}
 {% block content %}
-  <p><a href="/runs/{{ timestamp }}">← Run {{ timestamp }}</a></p>
   <h1><code>{{ filename }}</code></h1>
 
   {% if error %}

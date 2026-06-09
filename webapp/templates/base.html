@@ -3,25 +3,52 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% if webapp_token %}<meta name="webapp-token" content="{{ webapp_token }}">{% endif %}
   <title>{% block title %}sdwan-bulk-show Web UI{% endblock %}</title>
+  <script>
+    // Apply the saved theme before first paint to avoid a flash of the wrong
+    // colour scheme. Mirrors theme.js (light | dark | system).
+    (function () {
+      try {
+        var t = window.localStorage.getItem("theme");
+        if (t === "light" || t === "dark") {
+          document.documentElement.setAttribute("data-theme", t);
+        }
+      } catch (e) { /* ignore */ }
+    })();
+  </script>
   <link rel="stylesheet" href="/static/style.css?v={{ asset_version }}">
 </head>
 <body>
+  {% set path = request.url.path %}
+  <a class="skip-link" href="#main">Skip to main content</a>
   <header class="topbar">
     <div class="topbar__inner">
-      <a class="brand" href="/">sdwan-bulk-show</a>
-      <nav class="nav">
-        <a href="/" class="nav__link">Run</a>
-        <a href="/runs" class="nav__link">Runs</a>
+      <a class="brand" href="/"><span class="brand__dot" aria-hidden="true"></span>sdwan-bulk-show</a>
+      <nav class="nav" aria-label="Primary">
+        <a href="/"
+           class="nav__link{% if path == '/' %} nav__link--active{% endif %}"
+           {% if path == '/' %}aria-current="page"{% endif %}>Run</a>
+        <a href="/runs"
+           class="nav__link{% if path.startswith('/runs') %} nav__link--active{% endif %}"
+           {% if path.startswith('/runs') %}aria-current="page"{% endif %}>Runs</a>
       </nav>
+      <div class="topbar__spacer"></div>
+      <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Toggle theme">
+        <span class="theme-toggle__icon" aria-hidden="true">🖥</span>
+        <span class="theme-toggle__label">System</span>
+      </button>
     </div>
   </header>
-  <main class="container">
+  <main class="container" id="main">
+    {% block breadcrumb %}{% endblock %}
     {% block content %}{% endblock %}
   </main>
   <footer class="footer">
     <p>Local-only UI. Bound to loopback by default. Passwords never written to disk.</p>
   </footer>
+  <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="false"></div>
+  <script src="/static/theme.js?v={{ asset_version }}"></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

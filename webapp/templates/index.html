@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Run · sdwan-bulk-show{% endblock %}
 {% block content %}
+  {% set fmts = form.output_formats if form and form.output_formats else ['text'] %}
   <h1>Run bulk-show via vManage</h1>
   <p class="lede">
     Submits the form, ssh-es to vManage, drops into <code>vshell</code>, and
@@ -16,10 +17,10 @@
   {% endif %}
 
   <div class="toolbar" id="settings-toolbar">
-    <span class="toolbar__label">Settings:</span>
-    <label class="button button--ghost" for="settings-import-input">Import JSON</label>
+    <span class="toolbar__label">Settings</span>
+    <label class="button button--ghost button--sm" for="settings-import-input">Import JSON</label>
     <input type="file" id="settings-import-input" accept=".json,application/json" hidden>
-    <button type="button" class="button button--ghost" id="settings-export-btn">Export JSON</button>
+    <button type="button" class="button button--ghost button--sm" id="settings-export-btn">Export JSON</button>
     <label class="check toolbar__check">
       <input type="checkbox" id="settings-export-password">
       <span>Include password in export (insecure)</span>
@@ -27,28 +28,37 @@
     <span class="toolbar__hint" id="settings-status" role="status" aria-live="polite"></span>
   </div>
 
-  <form action="/run" method="post" class="form" id="run-form">
+  <form action="/run" method="post" class="form" id="run-form" novalidate>
     <fieldset class="form__group">
-      <legend>vManage connection</legend>
+      <legend>Connection</legend>
+      <div class="field-grid">
+        <label class="field">
+          <span>vManage host or IP</span>
+          <input type="text" name="vmanage_host" required
+                 autocomplete="off" spellcheck="false"
+                 placeholder="vmanage.example.com"
+                 value="{{ form.vmanage_host if form else '' }}">
+        </label>
+        <label class="field">
+          <span>SSH user</span>
+          <input type="text" name="user" required
+                 autocomplete="username" spellcheck="false"
+                 placeholder="admin"
+                 value="{{ form.user if form else '' }}">
+        </label>
+      </div>
       <label class="field">
-        <span>vManage host or IP</span>
-        <input type="text" name="vmanage_host" required
-               placeholder="vmanage.example.com"
-               value="{{ form.vmanage_host if form else '' }}">
-      </label>
-      <label class="field">
-        <span>SSH user</span>
-        <input type="text" name="user" required
-               placeholder="admin"
-               value="{{ form.user if form else '' }}">
-      </label>
-      <label class="field">
-        <span>SSH password (used for vManage <em>and</em> edges)</span>
-        <input type="password" name="password" required autocomplete="off">
+        <span>SSH password <small>(used for vManage <em>and</em> edges)</small></span>
+        <span class="field__pw">
+          <input type="password" name="password" id="password" required
+                 autocomplete="current-password">
+          <button type="button" class="field__pw-toggle" id="password-toggle"
+                  aria-label="Show password" aria-pressed="false">Show</button>
+        </span>
       </label>
       <label class="field">
         <span>Remote working dir on vManage</span>
-        <input type="text" name="remote_dir"
+        <input type="text" name="remote_dir" spellcheck="false"
                value="{{ form.remote_dir if form else default_remote_dir }}">
       </label>
     </fieldset>
@@ -60,7 +70,7 @@
           host.txt&nbsp;
           <small>One <code>IP,user</code> per line; password optional (the field above is reused if omitted). Mark controllers with <code>,type=controller</code> (vBond/vSmart/vEdge).</small>
         </span>
-        <textarea name="hosts_text" rows="6" required
+        <textarea name="hosts_text" rows="6" required spellcheck="false"
                   placeholder="192.168.1.1,admin,type=controller&#10;192.168.1.2,admin">{{ form.hosts_text if form else '' }}</textarea>
       </label>
     </fieldset>
@@ -71,13 +81,21 @@
         Each host runs the list matching its device type. Leave one box empty
         to reuse the other for both types.
       </p>
+      <div class="preset-bar">
+        <label for="cmd-preset">Presets:</label>
+        <select id="cmd-preset">
+          <option value="">— choose —</option>
+        </select>
+        <button type="button" class="button button--ghost button--sm" id="cmd-preset-apply">Apply</button>
+        <button type="button" class="button button--ghost button--sm" id="cmd-preset-save">Save current as…</button>
+      </div>
       <div class="cmd-grid">
         <label class="field">
           <span>
             Controller commands&nbsp;
             <small>vBond / vSmart / vEdge (viptela CLI).</small>
           </span>
-          <textarea name="controller_commands_text" rows="6"
+          <textarea name="controller_commands_text" rows="6" spellcheck="false"
                     placeholder="show control connections&#10;show omp peers">{{ form.controller_commands_text if form else '' }}</textarea>
         </label>
         <label class="field">
@@ -85,30 +103,75 @@
             Edge commands&nbsp;
             <small>cEdge / IOS-XE.</small>
           </span>
-          <textarea name="edge_commands_text" rows="6"
+          <textarea name="edge_commands_text" rows="6" spellcheck="false"
                     placeholder="show ip route&#10;show sdwan omp peers">{{ form.edge_commands_text if form else '' }}</textarea>
         </label>
       </div>
     </fieldset>
 
-    <fieldset class="form__group">
-      <legend>Options</legend>
-      <label class="check">
-        <input type="checkbox" name="download_outputs"
-               {% if form is none or form.download_outputs %}checked{% endif %}>
-        <span>Download <code>output_*.txt</code> back to <code>logs/&lt;timestamp&gt;/</code></span>
-      </label>
-      <label class="check">
-        <input type="checkbox" name="verbose"
-               {% if form and form.verbose %}checked{% endif %}>
-        <span>Verbose run_on_vmanage.py output</span>
-      </label>
-      <label class="check">
-        <input type="checkbox" name="reject_unknown_hosts"
-               {% if form and form.reject_unknown_hosts %}checked{% endif %}>
-        <span>Reject unknown vManage host keys (recommended after first run)</span>
-      </label>
-    </fieldset>
+    <details class="form__section" id="options-section">
+      <summary>
+        Advanced options
+        <span class="form__section-hint">retries · workers · formats · port · host-key checking</span>
+      </summary>
+      <div class="form__section-body">
+        <div class="field-grid">
+          <label class="field">
+            <span>Retries <small>per host (0–10)</small></span>
+            <input type="number" name="retries" min="0" max="10" step="1"
+                   value="{{ form.retries if form else 0 }}">
+          </label>
+          <label class="field">
+            <span>Max workers <small>(blank = auto)</small></span>
+            <input type="number" name="max_workers" min="1" max="100" step="1"
+                   placeholder="auto"
+                   value="{{ form.max_workers if form and form.max_workers is not none else '' }}">
+          </label>
+          <label class="field">
+            <span>Controller SSH port <small>(1–65535)</small></span>
+            <input type="number" name="controller_port" min="1" max="65535" step="1"
+                   value="{{ form.controller_port if form else 22 }}">
+          </label>
+        </div>
+
+        <div class="field">
+          <span>Output formats <small>(per host)</small></span>
+          <div class="check-row">
+            <label class="check">
+              <input type="checkbox" name="output_formats" value="text"
+                     {% if 'text' in fmts %}checked{% endif %}>
+              <span>text</span>
+            </label>
+            <label class="check">
+              <input type="checkbox" name="output_formats" value="json"
+                     {% if 'json' in fmts %}checked{% endif %}>
+              <span>json</span>
+            </label>
+            <label class="check">
+              <input type="checkbox" name="output_formats" value="csv"
+                     {% if 'csv' in fmts %}checked{% endif %}>
+              <span>csv</span>
+            </label>
+          </div>
+        </div>
+
+        <label class="check">
+          <input type="checkbox" name="download_outputs"
+                 {% if form is none or form.download_outputs %}checked{% endif %}>
+          <span>Download <code>output_*</code> back to <code>logs/&lt;timestamp&gt;/</code></span>
+        </label>
+        <label class="check">
+          <input type="checkbox" name="verbose"
+                 {% if form and form.verbose %}checked{% endif %}>
+          <span>Verbose run_on_vmanage.py output</span>
+        </label>
+        <label class="check">
+          <input type="checkbox" name="reject_unknown_hosts"
+                 {% if form is none or form.reject_unknown_hosts %}checked{% endif %}>
+          <span>Reject unknown vManage host keys (recommended)</span>
+        </label>
+      </div>
+    </details>
 
     <div class="form__actions">
       <button type="submit" class="button" id="run-button">Run</button>
@@ -116,26 +179,41 @@
     </div>
   </form>
 
-  <section class="card" id="progress" hidden>
-    <h2>Progress</h2>
+  <section class="card card--reveal" id="progress" hidden>
+    <div class="progress__head">
+      <h2 style="margin:0">Progress</h2>
+      <div class="progress__head-actions">
+        <span class="progress__percent" id="percent">0%</span>
+        <button type="button" class="button button--danger button--sm" id="cancel-btn" hidden>Cancel</button>
+      </div>
+    </div>
+
     <div class="progress" id="progress-wrap" data-status="running">
+      <ol class="stepper" id="stepper" aria-label="Run phases"></ol>
       <div class="progress__head">
         <span class="progress__phase" id="phase">Starting</span>
-        <span class="progress__percent" id="percent">0%</span>
       </div>
       <progress class="progress__bar" id="bar" max="100" value="0">0%</progress>
       <div class="progress__meta">
         <span>status: <span class="status status--running" id="status">running</span></span>
-        <span id="counters">commands 0 / 0</span>
+        <span class="tnum" id="counters">commands 0 / 0</span>
+        <span class="tnum" id="hosts">hosts 0</span>
       </div>
       <p class="progress__message" id="message"></p>
     </div>
 
-    <h2 class="progress__sub">Live log <small class="progress__note">(password masked)</small></h2>
-    <pre class="filebox" id="log-tail"></pre>
+    <details class="logpanel progress__sub" id="log-panel" open>
+      <summary>
+        Live log <span class="progress__note">(password masked)</span>
+        <span class="logpanel__actions">
+          <button type="button" class="button button--ghost button--sm" id="copy-log-btn">Copy log</button>
+        </span>
+      </summary>
+      <pre class="filebox" id="log-tail"></pre>
+    </details>
   </section>
 
-  <section class="card" id="results" hidden>
+  <section class="card card--reveal" id="results" hidden tabindex="-1">
     <h2>Results</h2>
     <p id="results-summary" class="progress__note"></p>
     <div class="results__actions" id="results-actions">
@@ -152,17 +230,147 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="/static/open-actions.js?v={{ asset_version }}"></script>
+<script src="/static/progress-ui.js?v={{ asset_version }}"></script>
 <script src="/static/filediff.js?v={{ asset_version }}"></script>
 <script>
-  // Client-side settings import/export. Everything happens in the browser:
-  // the JSON file is read locally and the form is prefilled, so no settings
-  // (and, by default, no password) are ever sent to or stored on the server.
+  // Password show/hide.
+  (function () {
+    "use strict";
+    var input = document.getElementById("password");
+    var btn = document.getElementById("password-toggle");
+    if (!input || !btn) {
+      return;
+    }
+    btn.addEventListener("click", function () {
+      var show = input.type === "password";
+      input.type = show ? "text" : "password";
+      btn.textContent = show ? "Hide" : "Show";
+      btn.setAttribute("aria-pressed", show ? "true" : "false");
+      btn.setAttribute("aria-label", show ? "Hide password" : "Show password");
+    });
+  })();
+
+  // Command presets: built-in lists + user-saved (localStorage). No server
+  // change — they only prefill the controller / edge command boxes.
+  (function () {
+    "use strict";
+    var STORE_KEY = "cmd-presets";
+    var BUILTINS = {
+      "Control-plane health": {
+        controller: "show control connections\nshow control local-properties\nshow omp peers",
+        edge: "show sdwan control connections\nshow sdwan omp peers",
+      },
+      "Routing": {
+        controller: "show omp routes",
+        edge: "show ip route\nshow sdwan omp routes",
+      },
+      "Versions": {
+        controller: "show version",
+        edge: "show version",
+      },
+    };
+
+    var select = document.getElementById("cmd-preset");
+    var applyBtn = document.getElementById("cmd-preset-apply");
+    var saveBtn = document.getElementById("cmd-preset-save");
+    var ctrl = document.querySelector('[name="controller_commands_text"]');
+    var edge = document.querySelector('[name="edge_commands_text"]');
+    if (!select || !ctrl || !edge) {
+      return;
+    }
+
+    function loadSaved() {
+      try {
+        var raw = window.localStorage.getItem(STORE_KEY);
+        var data = raw ? JSON.parse(raw) : {};
+        return data && typeof data === "object" ? data : {};
+      } catch (e) {
+        return {};
+      }
+    }
+
+    function persistSaved(data) {
+      try {
+        window.localStorage.setItem(STORE_KEY, JSON.stringify(data));
+      } catch (e) {
+        /* ignore */
+      }
+    }
+
+    function rebuild() {
+      var saved = loadSaved();
+      select.textContent = "";
+      var first = document.createElement("option");
+      first.value = "";
+      first.textContent = "— choose —";
+      select.appendChild(first);
+      function addGroup(label, obj) {
+        var names = Object.keys(obj);
+        if (!names.length) {
+          return;
+        }
+        var group = document.createElement("optgroup");
+        group.label = label;
+        names.forEach(function (name) {
+          var opt = document.createElement("option");
+          opt.value = (label === "Saved" ? "saved:" : "builtin:") + name;
+          opt.textContent = name;
+          group.appendChild(opt);
+        });
+        select.appendChild(group);
+      }
+      addGroup("Built-in", BUILTINS);
+      addGroup("Saved", saved);
+    }
+
+    function apply() {
+      var val = select.value;
+      if (!val) {
+        return;
+      }
+      var saved = loadSaved();
+      var preset = null;
+      if (val.indexOf("builtin:") === 0) {
+        preset = BUILTINS[val.slice(8)];
+      } else if (val.indexOf("saved:") === 0) {
+        preset = saved[val.slice(6)];
+      }
+      if (preset) {
+        ctrl.value = preset.controller || "";
+        edge.value = preset.edge || "";
+        if (window.toast) {
+          window.toast("Applied preset.", "ok");
+        }
+      }
+    }
+
+    if (applyBtn) {
+      applyBtn.addEventListener("click", apply);
+    }
+    select.addEventListener("change", apply);
+    if (saveBtn) {
+      saveBtn.addEventListener("click", function () {
+        var name = window.prompt("Save current commands as preset named:");
+        if (!name) {
+          return;
+        }
+        var saved = loadSaved();
+        saved[name] = { controller: ctrl.value, edge: edge.value };
+        persistSaved(saved);
+        rebuild();
+        if (window.toast) {
+          window.toast('Saved preset "' + name + '".', "ok");
+        }
+      });
+    }
+    rebuild();
+  })();
+
+  // Client-side settings import/export (everything stays in the browser).
   (function () {
     "use strict";
 
-    // Text fields and textareas share the same value handling; checkboxes are
-    // handled via the "checks" list. The two command boxes replaced the old
-    // single ``commands_text`` field, but legacy imports are still honoured.
     var TEXT_KEYS = [
       "vmanage_host",
       "user",
@@ -170,8 +378,12 @@
       "hosts_text",
       "controller_commands_text",
       "edge_commands_text",
+      "retries",
+      "max_workers",
+      "controller_port",
     ];
     var CHECK_KEYS = ["download_outputs", "verbose", "reject_unknown_hosts"];
+    var FORMATS = ["text", "json", "csv"];
     var PASSWORD_KEY = "password";
     var LEGACY_COMMANDS_KEY = "commands_text";
 
@@ -186,15 +398,23 @@
     }
 
     function setStatus(message, isError) {
-      if (!status) {
-        return;
+      if (status) {
+        status.textContent = message || "";
+        status.classList.toggle("toolbar__hint--error", Boolean(isError));
       }
-      status.textContent = message || "";
-      status.classList.toggle("toolbar__hint--error", Boolean(isError));
+      if (message && window.toast) {
+        window.toast(message, isError ? "error" : "ok");
+      }
     }
 
     function field(name) {
       return form.elements.namedItem(name);
+    }
+
+    function formatBoxes() {
+      return Array.prototype.slice.call(
+        form.querySelectorAll('[name="output_formats"]')
+      );
     }
 
     function applySettings(data) {
@@ -211,8 +431,6 @@
           }
         }
       });
-      // Legacy compatibility: a file with the old single ``commands_text`` key
-      // (and neither new key) seeds BOTH command boxes.
       var hasController = Object.prototype.hasOwnProperty.call(
         data, "controller_commands_text"
       );
@@ -229,14 +447,8 @@
           : String(data[LEGACY_COMMANDS_KEY]);
         var ctrl = field("controller_commands_text");
         var edge = field("edge_commands_text");
-        if (ctrl) {
-          ctrl.value = legacy;
-          applied += 1;
-        }
-        if (edge) {
-          edge.value = legacy;
-          applied += 1;
-        }
+        if (ctrl) { ctrl.value = legacy; applied += 1; }
+        if (edge) { edge.value = legacy; applied += 1; }
       }
       CHECK_KEYS.forEach(function (key) {
         if (Object.prototype.hasOwnProperty.call(data, key)) {
@@ -247,9 +459,13 @@
           }
         }
       });
-      // Password is applied only when explicitly present in the file. Storing
-      // it in JSON is the user's choice; we never require or export it
-      // silently.
+      if (Object.prototype.hasOwnProperty.call(data, "output_formats")) {
+        var want = Array.isArray(data.output_formats) ? data.output_formats : [];
+        formatBoxes().forEach(function (box) {
+          box.checked = want.indexOf(box.value) >= 0;
+        });
+        applied += 1;
+      }
       if (Object.prototype.hasOwnProperty.call(data, PASSWORD_KEY)) {
         var pw = field(PASSWORD_KEY);
         if (pw) {
@@ -270,6 +486,9 @@
         var el = field(key);
         out[key] = el ? el.checked : false;
       });
+      out.output_formats = formatBoxes()
+        .filter(function (b) { return b.checked; })
+        .map(function (b) { return b.value; });
       if (includePassword) {
         var pw = field(PASSWORD_KEY);
         out[PASSWORD_KEY] = pw ? pw.value : "";
@@ -288,14 +507,10 @@
           try {
             var data = JSON.parse(String(reader.result));
             var count = applySettings(data);
-            setStatus(
-              "Imported " + count + " field(s) from " + file.name + ".",
-              false
-            );
+            setStatus("Imported " + count + " field(s) from " + file.name + ".", false);
           } catch (err) {
             setStatus("Import failed: " + err.message, true);
           }
-          // Reset so selecting the same file again re-triggers change.
           importInput.value = "";
         };
         reader.onerror = function () {
@@ -308,9 +523,7 @@
 
     if (exportBtn) {
       exportBtn.addEventListener("click", function () {
-        var includePassword = Boolean(
-          exportPwToggle && exportPwToggle.checked
-        );
+        var includePassword = Boolean(exportPwToggle && exportPwToggle.checked);
         var payload = collectSettings(includePassword);
         var blob = new Blob([JSON.stringify(payload, null, 2) + "\n"], {
           type: "application/json",
@@ -333,10 +546,8 @@
     }
   })();
 
-  // Inline run flow: submit via fetch, poll progress, then render results
-  // (pick-two-and-diff file list + open-folder buttons) on the same page. We
-  // only ever use textContent / element.value (never innerHTML) so masked
-  // output cannot inject markup.
+  // Inline run flow: validate, submit via fetch, poll progress (stepper +
+  // bar), then render results. textContent / element.value only.
   (function () {
     "use strict";
 
@@ -350,30 +561,63 @@
     var formError = document.getElementById("form-error");
 
     var progressSection = document.getElementById("progress");
-    var wrap = document.getElementById("progress-wrap");
-    var bar = document.getElementById("bar");
-    var percentEl = document.getElementById("percent");
-    var phaseEl = document.getElementById("phase");
-    var statusEl = document.getElementById("status");
-    var countersEl = document.getElementById("counters");
-    var messageEl = document.getElementById("message");
-    var logEl = document.getElementById("log-tail");
+    var cancelBtn = document.getElementById("cancel-btn");
+    var copyLogBtn = document.getElementById("copy-log-btn");
+
+    var els = {
+      wrap: document.getElementById("progress-wrap"),
+      bar: document.getElementById("bar"),
+      percent: document.getElementById("percent"),
+      phase: document.getElementById("phase"),
+      status: document.getElementById("status"),
+      counters: document.getElementById("counters"),
+      hosts: document.getElementById("hosts"),
+      message: document.getElementById("message"),
+      log: document.getElementById("log-tail"),
+      stepper: document.getElementById("stepper"),
+    };
 
     var resultsSection = document.getElementById("results");
     var resultsSummary = document.getElementById("results-summary");
     var detailLink = document.getElementById("results-detail-link");
     var compareLink = document.getElementById("results-compare-link");
-    var finderBtn = document.getElementById("open-finder-btn");
-    var terminalBtn = document.getElementById("open-terminal-btn");
     var openStatus = document.getElementById("open-status");
     var fileDiffContainer = document.getElementById("results-filediff");
 
     var currentTimestamp = null;
+    var currentJobId = null;
+
+    // Open-folder buttons reuse the shared OpenActions helper, reading the
+    // (dynamic) timestamp once a run completes.
+    if (window.OpenActions) {
+      window.OpenActions.bindFolderButtons({
+        finder: document.getElementById("open-finder-btn"),
+        terminal: document.getElementById("open-terminal-btn"),
+        statusEl: openStatus,
+        getTimestamp: function () { return currentTimestamp; },
+      });
+    }
+
+    if (copyLogBtn) {
+      copyLogBtn.addEventListener("click", function () {
+        var text = els.log ? els.log.textContent : "";
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function () {
+            if (window.toast) { window.toast("Log copied.", "ok"); }
+          });
+        }
+      });
+    }
 
     function setRunning(isRunning) {
       if (runButton) {
         runButton.disabled = isRunning;
         runButton.textContent = isRunning ? "Running…" : "Run";
+      }
+      if (cancelBtn) {
+        cancelBtn.hidden = !isRunning;
+        cancelBtn.disabled = false;
+        cancelBtn.textContent = "Cancel";
       }
     }
 
@@ -399,35 +643,30 @@
       }
     }
 
-    function render(data) {
-      var pct = typeof data.percent === "number" ? data.percent : 0;
-      if (bar) {
-        bar.value = pct;
+    function nonEmptyLines(text) {
+      return String(text || "")
+        .split("\n")
+        .filter(function (l) {
+          var s = l.trim();
+          return s && s.charAt(0) !== "#";
+        }).length;
+    }
+
+    function validate() {
+      var hosts = form.elements.namedItem("hosts_text");
+      var ctrl = form.elements.namedItem("controller_commands_text");
+      var edge = form.elements.namedItem("edge_commands_text");
+      if (hosts && nonEmptyLines(hosts.value) === 0) {
+        return "Add at least one host (IP,user[,pass]) to the inventory.";
       }
-      if (percentEl) {
-        percentEl.textContent = pct + "%";
+      if (
+        ctrl && edge &&
+        nonEmptyLines(ctrl.value) === 0 &&
+        nonEmptyLines(edge.value) === 0
+      ) {
+        return "Add at least one CLI command to the controller or edge box.";
       }
-      if (phaseEl) {
-        phaseEl.textContent = data.phase || "";
-      }
-      if (statusEl) {
-        statusEl.textContent = data.status || "";
-        statusEl.className = "status status--" + (data.status || "unknown");
-      }
-      if (wrap) {
-        wrap.setAttribute("data-status", data.status || "running");
-      }
-      if (countersEl) {
-        countersEl.textContent =
-          "commands " + (data.commands_done || 0) + " / " + (data.commands_total || 0);
-      }
-      if (messageEl) {
-        messageEl.textContent = data.message || "";
-      }
-      if (logEl && Array.isArray(data.log_tail)) {
-        logEl.textContent = data.log_tail.join("\n");
-        logEl.scrollTop = logEl.scrollHeight;
-      }
+      return null;
     }
 
     function renderFileDiff(outputs) {
@@ -443,9 +682,13 @@
 
     function finish(data) {
       setRunning(false);
+      if (cancelBtn) {
+        cancelBtn.hidden = true;
+      }
       currentTimestamp = data.timestamp || null;
       if (resultsSection) {
         resultsSection.hidden = false;
+        resultsSection.focus();
       }
       if (resultsSummary) {
         if (data.error) {
@@ -463,8 +706,6 @@
           compareLink.href =
             "/runs/" + encodeURIComponent(currentTimestamp) + "/compare";
         }
-        // Discover output files via the run manifest, then render the
-        // pick-two-and-diff list (no raw bodies are pulled into the page).
         fetch(
           "/api/runs/" + encodeURIComponent(currentTimestamp) +
             "/file?name=manifest.json",
@@ -479,7 +720,7 @@
                 if (Array.isArray(manifest.outputs)) {
                   outputs = manifest.outputs;
                 }
-              } catch (err) { /* manifest unreadable; empty list */ }
+              } catch (err) { /* manifest unreadable */ }
             }
             renderFileDiff(outputs);
           })
@@ -499,10 +740,10 @@
           return resp.json();
         })
         .then(function (data) {
-          render(data);
+          window.ProgressUI.applyProgress(els, data);
           if (data.status && data.status !== "running") {
             finish(data);
-            return; // stop polling
+            return;
           }
           window.setTimeout(function () { poll(jobId); }, POLL_MS);
         })
@@ -511,56 +752,35 @@
         });
     }
 
-    function postOpen(target) {
-      if (!currentTimestamp) {
-        return;
-      }
-      if (openStatus) {
-        openStatus.textContent = "Opening " + target + "…";
-        openStatus.classList.remove("toolbar__hint--error");
-      }
-      fetch("/runs/" + encodeURIComponent(currentTimestamp) + "/open", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Requested-With": "XMLHttpRequest",
-        },
-        body: JSON.stringify({ target: target }),
-      })
-        .then(function (resp) {
-          return resp.json().then(function (body) {
-            return { ok: resp.ok, body: body };
+    if (cancelBtn) {
+      cancelBtn.addEventListener("click", function () {
+        if (!currentJobId) {
+          return;
+        }
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = "Cancelling…";
+        fetch("/api/runs/" + encodeURIComponent(currentJobId) + "/cancel", {
+          method: "POST",
+          headers: window.csrfHeaders({ "X-Requested-With": "XMLHttpRequest" }),
+        })
+          .then(function (resp) { return resp.json(); })
+          .then(function () {
+            if (window.toast) { window.toast("Cancellation requested.", "ok"); }
+          })
+          .catch(function () {
+            if (window.toast) { window.toast("Could not request cancel.", "error"); }
           });
-        })
-        .then(function (res) {
-          if (openStatus) {
-            if (res.ok && res.body && res.body.ok) {
-              openStatus.textContent = "Opened in " + target + ".";
-            } else {
-              openStatus.textContent =
-                (res.body && res.body.error) || "Could not open folder.";
-              openStatus.classList.add("toolbar__hint--error");
-            }
-          }
-        })
-        .catch(function () {
-          if (openStatus) {
-            openStatus.textContent = "Could not reach the server.";
-            openStatus.classList.add("toolbar__hint--error");
-          }
-        });
-    }
-
-    if (finderBtn) {
-      finderBtn.addEventListener("click", function () { postOpen("finder"); });
-    }
-    if (terminalBtn) {
-      terminalBtn.addEventListener("click", function () { postOpen("terminal"); });
+      });
     }
 
     form.addEventListener("submit", function (event) {
       event.preventDefault();
       clearFormError();
+      var problem = validate();
+      if (problem) {
+        showFormError(problem);
+        return;
+      }
       setRunning(true);
       if (resultsSection) {
         resultsSection.hidden = true;
@@ -570,12 +790,18 @@
       }
       if (progressSection) {
         progressSection.hidden = false;
+        progressSection.scrollIntoView({ behavior: "smooth", block: "start" });
       }
-      render({ percent: 0, phase: "Starting", status: "running", log_tail: [] });
+      window.ProgressUI.applyProgress(els, {
+        percent: 0, phase: "Starting", status: "running", log_tail: [],
+      });
 
       fetch("/run", {
         method: "POST",
-        headers: { "X-Requested-With": "XMLHttpRequest", "Accept": "application/json" },
+        headers: window.csrfHeaders({
+          "X-Requested-With": "XMLHttpRequest",
+          "Accept": "application/json",
+        }),
         body: new FormData(form),
       })
         .then(function (resp) {
@@ -585,6 +811,7 @@
         })
         .then(function (res) {
           if (res.status === 200 && res.body && res.body.job_id) {
+            currentJobId = res.body.job_id;
             poll(res.body.job_id);
             return;
           }

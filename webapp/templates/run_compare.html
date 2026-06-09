@@ -1,7 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Compare · {{ timestamp }} · sdwan-bulk-show{% endblock %}
+{% block breadcrumb %}
+  <nav class="breadcrumb" aria-label="Breadcrumb">
+    <a href="/runs">Runs</a><span class="breadcrumb__sep">/</span>
+    <a href="/runs/{{ timestamp }}"><code>{{ timestamp }}</code></a><span class="breadcrumb__sep">/</span>
+    <span>Compare</span>
+  </nav>
+{% endblock %}
 {% block content %}
-  <p><a href="/runs/{{ timestamp }}">← Run {{ timestamp }}</a></p>
   <h1>Compare <code>{{ timestamp }}</code></h1>
 
   {% if error %}
@@ -12,6 +18,7 @@
     <p class="lede">Pick two <code>output_*</code> files, then press <strong>Diff</strong>.</p>
 
     <div class="results__actions">
+      <a href="/runs/compare-across?a={{ timestamp }}" class="button button--ghost">Compare across runs</a>
       <button type="button" class="button button--ghost" id="open-finder-btn">Reveal in Finder</button>
       <button type="button" class="button button--ghost" id="open-terminal-btn">Open in Terminal</button>
       <span class="toolbar__hint" id="open-status" role="status" aria-live="polite"></span>
@@ -39,6 +46,7 @@
 
 {% block scripts %}
 {% if not error %}
+<script src="/static/open-actions.js?v={{ asset_version }}"></script>
 <script src="/static/filediff.js?v={{ asset_version }}"></script>
 <script>
   (function () {
@@ -56,52 +64,13 @@
       });
     }
 
-    var finderBtn = document.getElementById("open-finder-btn");
-    var terminalBtn = document.getElementById("open-terminal-btn");
-    var openStatus = document.getElementById("open-status");
-
-    function postOpen(target) {
-      if (openStatus) {
-        openStatus.textContent = "Opening " + target + "…";
-        openStatus.classList.remove("toolbar__hint--error");
-      }
-      fetch("/runs/" + encodeURIComponent(TIMESTAMP) + "/open", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Requested-With": "XMLHttpRequest",
-        },
-        body: JSON.stringify({ target: target }),
-      })
-        .then(function (resp) {
-          return resp.json().then(function (body) {
-            return { ok: resp.ok, body: body };
-          });
-        })
-        .then(function (res) {
-          if (openStatus) {
-            if (res.ok && res.body && res.body.ok) {
-              openStatus.textContent = "Opened in " + target + ".";
-            } else {
-              openStatus.textContent =
-                (res.body && res.body.error) || "Could not open folder.";
-              openStatus.classList.add("toolbar__hint--error");
-            }
-          }
-        })
-        .catch(function () {
-          if (openStatus) {
-            openStatus.textContent = "Could not reach the server.";
-            openStatus.classList.add("toolbar__hint--error");
-          }
-        });
-    }
-
-    if (finderBtn) {
-      finderBtn.addEventListener("click", function () { postOpen("finder"); });
-    }
-    if (terminalBtn) {
-      terminalBtn.addEventListener("click", function () { postOpen("terminal"); });
+    if (window.OpenActions) {
+      window.OpenActions.bindFolderButtons({
+        timestamp: TIMESTAMP,
+        finder: document.getElementById("open-finder-btn"),
+        terminal: document.getElementById("open-terminal-btn"),
+        statusEl: document.getElementById("open-status"),
+      });
     }
   })();
 </script>

@@ -1,7 +1,12 @@
 {% extends "base.html" %}
 {% block title %}{{ timestamp }} · sdwan-bulk-show{% endblock %}
+{% block breadcrumb %}
+  <nav class="breadcrumb" aria-label="Breadcrumb">
+    <a href="/runs">Runs</a><span class="breadcrumb__sep">/</span>
+    <span><code>{{ timestamp }}</code></span>
+  </nav>
+{% endblock %}
 {% block content %}
-  <p><a href="/runs">← Past runs</a></p>
   <h1>Run <code>{{ timestamp }}</code></h1>
 
   {% if error %}
@@ -12,36 +17,91 @@
     {% if run.manifest %}
       {% set m = run.manifest %}
       <section class="card">
-        <h2>Summary</h2>
-        <dl class="kv">
-          <dt>Status</dt>
-          <dd><span class="status status--{{ run.status }}">{{ run.status }}</span> (rc={{ m.returncode }})</dd>
-          <dt>vManage</dt>
-          <dd>{{ m.vmanage_host }} <small>(user: {{ m.vmanage_user }})</small></dd>
-          <dt>Remote dir</dt>
-          <dd><code>{{ m.remote_dir }}</code></dd>
-          <dt>Hosts</dt>
-          <dd>{{ m.hosts_count }}</dd>
-          <dt>Commands</dt>
-          <dd>
-            {{ m.controller_commands_count if m.controller_commands_count is defined else m.commands_count }} controller
-            /
-            {{ m.edge_commands_count if m.edge_commands_count is defined else m.commands_count }} edge
-          </dd>
-          <dt>Started</dt>
-          <dd>{{ m.started_at }}</dd>
-          <dt>Ended</dt>
-          <dd>{{ m.ended_at }} <small>({{ "%.2f"|format(m.duration_sec) }} s)</small></dd>
-          <dt>Options</dt>
-          <dd>
-            download_outputs={{ m.options.download_outputs }},
-            verbose={{ m.options.verbose }},
-            reject_unknown_hosts={{ m.options.reject_unknown_hosts }}
-          </dd>
-          <dt>Output files</dt>
-          <dd>{{ m.outputs_count }}</dd>
+        <div class="hero">
+          <span class="status status--{{ run.status }} hero__status">{{ run.status }}</span>
+          <span class="hero__meta">
+            {{ m.vmanage_host }} <small>(user: {{ m.vmanage_user }})</small>
+            · rc={{ m.returncode }}
+            · {{ "%.2f"|format(m.duration_sec) }} s
+          </span>
+        </div>
+
+        <dl class="stat-grid">
+          <div class="stat">
+            <div class="stat__value tnum">{{ m.hosts_count }}</div>
+            <div class="stat__label">Hosts</div>
+          </div>
+          {% if m.hosts_ok is defined or m.hosts_failed is defined %}
+          <div class="stat">
+            <div class="stat__value tnum">
+              <span class="hostcount__ok">{{ m.hosts_ok|default(0) }}</span>
+              {% if m.hosts_failed|default(0) %}/ <span class="hostcount__fail">{{ m.hosts_failed }}</span>{% endif %}
+            </div>
+            <div class="stat__label">ok / failed</div>
+          </div>
+          {% endif %}
+          <div class="stat">
+            <div class="stat__value tnum">
+              {{ m.controller_commands_count if m.controller_commands_count is defined else m.commands_count }}
+              /
+              {{ m.edge_commands_count if m.edge_commands_count is defined else m.commands_count }}
+            </div>
+            <div class="stat__label">ctrl / edge cmds</div>
+          </div>
+          <div class="stat">
+            <div class="stat__value tnum">{{ m.outputs_count }}</div>
+            <div class="stat__label">Outputs</div>
+          </div>
         </dl>
+
+        <details class="files-all" style="margin-top:1rem">
+          <summary>Run metadata</summary>
+          <dl class="kv" style="margin-top:0.5rem">
+            <dt>Remote dir</dt>
+            <dd><code>{{ m.remote_dir }}</code></dd>
+            <dt>Started</dt>
+            <dd class="tnum">{{ m.started_at }}</dd>
+            <dt>Ended</dt>
+            <dd class="tnum">{{ m.ended_at }}</dd>
+            <dt>Options</dt>
+            <dd>
+              download_outputs={{ m.options.download_outputs }},
+              verbose={{ m.options.verbose }},
+              reject_unknown_hosts={{ m.options.reject_unknown_hosts }}
+              {% if m.options.retries is defined %}, retries={{ m.options.retries }}{% endif %}
+              {% if m.options.max_workers is defined %}, max_workers={{ m.options.max_workers if m.options.max_workers is not none else 'auto' }}{% endif %}
+              {% if m.options.output_formats is defined %}, formats={{ m.options.output_formats|join(',') }}{% endif %}
+              {% if m.options.controller_port is defined %}, controller_port={{ m.options.controller_port }}{% endif %}
+            </dd>
+          </dl>
+        </details>
       </section>
+
+      {% if m.host_results %}
+        <section class="card">
+          <h2>Per-host results</h2>
+          <table class="hosts-table">
+            <thead>
+              <tr>
+                <th scope="col">Host</th>
+                <th scope="col">Type</th>
+                <th scope="col">Status</th>
+                <th scope="col">Detail</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for hr in m.host_results %}
+                <tr>
+                  <td><code>{{ hr.host }}</code></td>
+                  <td>{{ hr.device_type or "—" }}</td>
+                  <td><span class="status status--{{ hr.status or 'unknown' }}">{{ hr.status or "unknown" }}</span></td>
+                  <td>{% if hr.error %}<span class="host-error">{{ hr.error }}</span>{% else %}—{% endif %}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </section>
+      {% endif %}
     {% else %}
       <div class="alert alert--info" role="alert">
         No <code>manifest.json</code> for this run (likely created before the
@@ -53,6 +113,8 @@
       <h2>Output files</h2>
       <p class="progress__note">Pick two and press <strong>Diff</strong>, or open one in your editor.</p>
       <div class="results__actions" id="detail-actions">
+        <a href="/runs/{{ timestamp }}/compare" class="button button--ghost">Full compare view</a>
+        <a href="/runs/compare-across?a={{ timestamp }}" class="button button--ghost">Compare across runs</a>
         <button type="button" class="button button--ghost" id="open-finder-btn">Reveal in Finder</button>
         <button type="button" class="button button--ghost" id="open-terminal-btn">Open in Terminal</button>
         <span class="toolbar__hint" id="open-status" role="status" aria-live="polite"></span>
@@ -79,9 +141,9 @@
 
 {% block scripts %}
 {% if not error %}
+<script src="/static/open-actions.js?v={{ asset_version }}"></script>
 <script src="/static/filediff.js?v={{ asset_version }}"></script>
 <script>
-  // Wire up the pick-two-and-diff widget plus the open-folder buttons.
   (function () {
     "use strict";
 
@@ -97,52 +159,13 @@
       });
     }
 
-    var finderBtn = document.getElementById("open-finder-btn");
-    var terminalBtn = document.getElementById("open-terminal-btn");
-    var openStatus = document.getElementById("open-status");
-
-    function postOpen(target) {
-      if (openStatus) {
-        openStatus.textContent = "Opening " + target + "…";
-        openStatus.classList.remove("toolbar__hint--error");
-      }
-      fetch("/runs/" + encodeURIComponent(TIMESTAMP) + "/open", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Requested-With": "XMLHttpRequest",
-        },
-        body: JSON.stringify({ target: target }),
-      })
-        .then(function (resp) {
-          return resp.json().then(function (body) {
-            return { ok: resp.ok, body: body };
-          });
-        })
-        .then(function (res) {
-          if (openStatus) {
-            if (res.ok && res.body && res.body.ok) {
-              openStatus.textContent = "Opened in " + target + ".";
-            } else {
-              openStatus.textContent =
-                (res.body && res.body.error) || "Could not open folder.";
-              openStatus.classList.add("toolbar__hint--error");
-            }
-          }
-        })
-        .catch(function () {
-          if (openStatus) {
-            openStatus.textContent = "Could not reach the server.";
-            openStatus.classList.add("toolbar__hint--error");
-          }
-        });
-    }
-
-    if (finderBtn) {
-      finderBtn.addEventListener("click", function () { postOpen("finder"); });
-    }
-    if (terminalBtn) {
-      terminalBtn.addEventListener("click", function () { postOpen("terminal"); });
+    if (window.OpenActions) {
+      window.OpenActions.bindFolderButtons({
+        timestamp: TIMESTAMP,
+        finder: document.getElementById("open-finder-btn"),
+        terminal: document.getElementById("open-terminal-btn"),
+        statusEl: document.getElementById("open-status"),
+      });
     }
   })();
 </script>

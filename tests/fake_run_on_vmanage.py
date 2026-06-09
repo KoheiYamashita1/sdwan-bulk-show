@@ -64,6 +64,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--download-outputs", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--reject-unknown-hosts", action="store_true")
+    # Wave 1 (C3) wired-through bulk-show.py knobs. The stub just accepts them
+    # (and echoes them so tests can assert forwarding) without doing any work.
+    parser.add_argument("--retries", type=int, default=0)
+    parser.add_argument("--retry-delay", type=float, default=5.0)
+    parser.add_argument("--max-workers", type=int, default=None)
+    parser.add_argument("--controller-port", type=int, default=22)
+    parser.add_argument("--output-format", default="text")
     return parser.parse_args(argv)
 
 
@@ -76,6 +83,26 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"received password length: {len(password)}")
 
+    # Echo the wired-through knobs so tests can assert forwarding end to end.
+    print(
+        "args: "
+        f"retries={args.retries} retry_delay={args.retry_delay} "
+        f"max_workers={args.max_workers} controller_port={args.controller_port} "
+        f"output_format={args.output_format} "
+        f"reject_unknown_hosts={args.reject_unknown_hosts}"
+    )
+
+    # FAKE_RUN_SPAWN_CHILD: fork a grandchild that sleeps so the killpg test can
+    # confirm the WHOLE process group dies on timeout/cancel, not just us.
+    if os.environ.get("FAKE_RUN_SPAWN_CHILD") == "1":
+        import subprocess
+
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(9999)"]
+        )
+        print(f"child pid: {child.pid}")
+        sys.stdout.flush()
+
     if os.environ.get("FAKE_RUN_HANG") == "1":
         sys.stdout.flush()
         time.sleep(9999)
@@ -86,6 +113,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     remote_dir = f"{args.remote_dir.rstrip('/')}/{timestamp}"
     print(f"using remote dir: {remote_dir}")
+
+    # Honour --output-format so json/csv promotion can be exercised. The base
+    # name stays ``output_<ip>.<ext>`` (no inner timestamp) for backward
+    # compatibility with the existing runner/smoke assertions.
+    ext_map = {"text": "txt", "json": "json", "csv": "csv"}
+    formats = [f.strip() for f in args.output_format.split(",") if f.strip()]
 
     if os.environ.get("FAKE_RUN_NO_LOGS") != "1":
         local_logs = Path(args.local_dir) / "logs" / timestamp
@@ -99,9 +132,11 @@ def main(argv: list[str] | None = None) -> int:
                 ip = line.split(",", 1)[0].strip()
                 if not ip:
                     continue
-                (local_logs / f"output_{ip}.txt").write_text(
-                    f"fake output for {ip}\n", encoding="utf-8"
-                )
+                for fmt in formats:
+                    ext = ext_map.get(fmt, "txt")
+                    (local_logs / f"output_{ip}.{ext}").write_text(
+                        f"fake output for {ip}\n", encoding="utf-8"
+                    )
 
     if os.environ.get("FAKE_RUN_FAIL") == "1":
         print("simulated failure", file=sys.stderr)

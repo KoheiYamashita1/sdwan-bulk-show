@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -188,7 +190,15 @@ class RunViaVManageTests(_IsolatedRepoMixin, unittest.TestCase):
         self.assertEqual(manifest["returncode"], 0)
         self.assertEqual(
             manifest["options"],
-            {"download_outputs": True, "verbose": False, "reject_unknown_hosts": False},
+            {
+                "download_outputs": True,
+                "verbose": False,
+                "reject_unknown_hosts": False,
+                "retries": 0,
+                "max_workers": None,
+                "output_formats": ["text"],
+                "controller_port": 22,
+            },
         )
 
     def test_password_is_masked_in_run_log(self) -> None:
@@ -505,6 +515,48 @@ class StartRunAsyncTests(_IsolatedRepoMixin, unittest.TestCase):
         self.assertEqual(snap["status"], "success")
         self.assertFalse(runner.RUN_LOCK.locked())
 
+    def test_request_cancel_marks_job_cancelled(self) -> None:
+        """A hung run can be cancelled; status flips to 'cancelled' (B3)."""
+
+        repo = self._make_repo()
+        job_id = self._start(
+            repo_root=repo, env={"FAKE_RUN_HANG": "1"}
+        )
+
+        # Wait until the worker has spawned the subprocess and recorded it.
+        job = runner.get_job(job_id)
+        deadline = time.monotonic() + 5.0
+        while job.proc is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertIsNotNone(job.proc, "subprocess handle never recorded")
+
+        self.assertEqual(runner.request_cancel(job_id), "cancelled")
+
+        snap = self._wait_for_finish(job_id)
+        self.assertEqual(snap["status"], "cancelled")
+        self.assertEqual(snap["percent"], 100)
+        self.assertFalse(runner.RUN_LOCK.locked(), "RUN_LOCK must be released")
+
+        # Partial run.log + a manifest with status 'cancelled' are preserved.
+        ts = snap["timestamp"]
+        run_dir = repo / "logs" / ts
+        self.assertTrue((run_dir / "run.log").is_file())
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "cancelled")
+
+    def test_request_cancel_unknown_job_returns_none(self) -> None:
+        self.assertIsNone(runner.request_cancel("does-not-exist"))
+
+    def test_request_cancel_finished_job_returns_terminal_status(self) -> None:
+        repo = self._make_repo()
+        job_id = self._start(
+            repo_root=repo, env={"FAKE_RUN_TS": "20260203_030303"}
+        )
+        snap = self._wait_for_finish(job_id)
+        self.assertEqual(snap["status"], "success")
+        # Cancelling an already-finished job reports its terminal status.
+        self.assertEqual(runner.request_cancel(job_id), "success")
+
 
 # ---------------------------------------------------------------------------
 # Split command lists: fallback rule, argv, manifest counts, progress total
@@ -632,6 +684,241 @@ class SplitCommandsRunTests(_IsolatedRepoMixin, unittest.TestCase):
         self.assertEqual(manifest["edge_commands_count"], 1)
         # Backward-compatible single figure stays present (max of both).
         self.assertEqual(manifest["commands_count"], 2)
+
+
+# ---------------------------------------------------------------------------
+# C3: CLI-option argv forwarding + json/csv output promotion
+# ---------------------------------------------------------------------------
+
+
+class KnobForwardingArgvTests(unittest.TestCase):
+    def _argv(self, **form_overrides) -> list[str]:
+        return runner._build_argv(
+            python_executable="py",
+            run_on_vmanage=Path("/x/run_on_vmanage.py"),
+            form=_form(**form_overrides),
+            tempdir=Path("/tmp/x"),
+            hosts_name="host.txt",
+            commands_name="command.txt",
+            bulk_name="bulk-show.py",
+        )
+
+    def test_forwards_set_knobs(self) -> None:
+        argv = self._argv(
+            retries=3,
+            max_workers=4,
+            output_formats=["text", "json"],
+            controller_port=2222,
+        )
+        self.assertEqual(argv[argv.index("--retries") + 1], "3")
+        self.assertEqual(argv[argv.index("--max-workers") + 1], "4")
+        self.assertEqual(argv[argv.index("--controller-port") + 1], "2222")
+        self.assertEqual(argv[argv.index("--output-format") + 1], "text,json")
+
+    def test_omits_default_optional_knobs_but_keeps_explicit_ones(self) -> None:
+        argv = self._argv()  # retries=0, max_workers=None, formats=["text"]
+        self.assertNotIn("--retries", argv)
+        self.assertNotIn("--max-workers", argv)
+        # controller-port and output-format are always forwarded explicitly.
+        self.assertEqual(argv[argv.index("--controller-port") + 1], "22")
+        self.assertEqual(argv[argv.index("--output-format") + 1], "text")
+
+
+class OutputFormatPromotionTests(_IsolatedRepoMixin, unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="webapp-fmt-test-")
+        self.addCleanup(self._tmp.cleanup)
+
+    def tearDown(self) -> None:
+        if runner.RUN_LOCK.locked():
+            try:
+                runner.RUN_LOCK.release()
+            except RuntimeError:
+                pass
+
+    def test_json_and_csv_outputs_are_promoted_and_recorded(self) -> None:
+        repo = self._make_repo()
+        result = self._run(
+            repo_root=repo,
+            env={"FAKE_RUN_TS": "20260701_010101"},
+            form=_form(output_formats=["text", "json", "csv"]),
+        )
+        run_dir = repo / "logs" / result.timestamp
+        names = sorted(
+            p.name for p in run_dir.iterdir() if p.name.startswith("output_")
+        )
+        for expected in (
+            "output_10.0.0.1.txt",
+            "output_10.0.0.1.json",
+            "output_10.0.0.1.csv",
+            "output_10.0.0.2.json",
+        ):
+            self.assertIn(expected, names)
+
+        manifest = json.loads(
+            (run_dir / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            manifest["options"]["output_formats"], ["text", "json", "csv"]
+        )
+        self.assertEqual(manifest["options"]["controller_port"], 22)
+        self.assertEqual(manifest["options"]["retries"], 0)
+
+
+# ---------------------------------------------------------------------------
+# B1: process-group kill on timeout
+# ---------------------------------------------------------------------------
+
+
+class ProcessGroupKillTests(_IsolatedRepoMixin, unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="webapp-killpg-test-")
+        self.addCleanup(self._tmp.cleanup)
+
+    def tearDown(self) -> None:
+        if runner.RUN_LOCK.locked():
+            try:
+                runner.RUN_LOCK.release()
+            except RuntimeError:
+                pass
+
+    def test_timeout_kills_the_whole_process_tree(self) -> None:
+        repo = self._make_repo()
+        result = self._run(
+            repo_root=repo,
+            env={"FAKE_RUN_SPAWN_CHILD": "1", "FAKE_RUN_HANG": "1"},
+            timeout=1.5,
+        )
+        self.assertTrue(result.timed_out)
+
+        match = re.search(r"child pid: (\d+)", result.log)
+        self.assertIsNotNone(match, f"child pid not found in log:\n{result.log}")
+        child_pid = int(match.group(1))
+
+        # The grandchild lived in the wrapper's process group, so killpg must
+        # have reaped it. Poll briefly for the OS to finish tearing it down.
+        deadline = time.monotonic() + 5.0
+        gone = False
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except (ProcessLookupError, OSError):
+                gone = True
+                break
+            time.sleep(0.05)
+        self.assertTrue(gone, f"grandchild {child_pid} survived the killpg")
+
+
+# ---------------------------------------------------------------------------
+# B2: job registry cap / TTL eviction
+# ---------------------------------------------------------------------------
+
+
+class JobRegistryEvictionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._saved_max = runner.MAX_JOBS
+        self._saved_ttl = runner.JOB_TTL_SECONDS
+        with runner._JOBS_LOCK:
+            self._saved_jobs = dict(runner._JOBS)
+            runner._JOBS.clear()
+
+    def tearDown(self) -> None:
+        runner.MAX_JOBS = self._saved_max
+        runner.JOB_TTL_SECONDS = self._saved_ttl
+        with runner._JOBS_LOCK:
+            runner._JOBS.clear()
+            runner._JOBS.update(self._saved_jobs)
+
+    def _terminal_job(self) -> runner.RunJob:
+        job = runner.RunJob.new(hosts_total=1, commands_total=1)
+        job.status = "success"
+        return job
+
+    def test_cap_evicts_oldest_jobs(self) -> None:
+        runner.MAX_JOBS = 5
+        runner.JOB_TTL_SECONDS = 1e9  # disable TTL pass for this test
+        ids = []
+        for _ in range(8):
+            job = self._terminal_job()
+            runner._register_job(job)
+            ids.append(job.job_id)
+        with runner._JOBS_LOCK:
+            self.assertEqual(len(runner._JOBS), 5)
+        # The three oldest were evicted; the newest survive.
+        self.assertIsNone(runner.get_job(ids[0]))
+        self.assertIsNone(runner.get_job(ids[2]))
+        self.assertIsNotNone(runner.get_job(ids[-1]))
+
+    def test_ttl_evicts_old_terminal_jobs(self) -> None:
+        runner.JOB_TTL_SECONDS = 0.0  # any terminal job is "expired"
+        old = self._terminal_job()
+        runner._register_job(old)
+        # Registering a fresh job triggers eviction; the old terminal job goes.
+        fresh = runner.RunJob.new(hosts_total=1, commands_total=1)  # running
+        runner._register_job(fresh)
+        self.assertIsNone(runner.get_job(old.job_id))
+        self.assertIsNotNone(runner.get_job(fresh.job_id))
+
+
+# ---------------------------------------------------------------------------
+# C5: per-host manifest roll-up
+# ---------------------------------------------------------------------------
+
+
+class CollectHostResultsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="webapp-hostresults-")
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+
+    def test_parses_text_session_end_marker(self) -> None:
+        (self.dir / "output_10.0.0.1_20260101_010101.txt").write_text(
+            "===== session begin: 10.0.0.1 user=admin port=830 started=t =====\n"
+            "show version output...\n"
+            "===== session end:   10.0.0.1 status=success ended=t duration=1.00s =====\n",
+            encoding="utf-8",
+        )
+        results = runner.collect_host_results("", self.dir)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["host"], "10.0.0.1")
+        self.assertEqual(results[0]["status"], "success")
+
+    def test_json_is_preferred_and_carries_device_type(self) -> None:
+        (self.dir / "output_10.0.0.2_20260101_010101.json").write_text(
+            json.dumps(
+                {
+                    "host": "10.0.0.2",
+                    "device_type": "controller",
+                    "status": "auth_error_ssh",
+                    "error": "auth error (ssh): bad",
+                }
+            ),
+            encoding="utf-8",
+        )
+        results = runner.collect_host_results("", self.dir)
+        self.assertEqual(results[0]["device_type"], "controller")
+        self.assertEqual(results[0]["status"], "auth_error_ssh")
+        self.assertIn("auth error", results[0]["error"])
+
+    def test_stdout_error_fallback_for_missing_file(self) -> None:
+        results = runner.collect_host_results(
+            "[10.0.0.9] auth error (ssh): nope\n", self.dir
+        )
+        self.assertEqual(results[0]["host"], "10.0.0.9")
+        self.assertEqual(results[0]["status"], "error")
+
+    def test_host_counts_from_main_done_line(self) -> None:
+        ok, failed = runner._host_counts(
+            "[main] done: success=3, failed=1\n", []
+        )
+        self.assertEqual((ok, failed), (3, 1))
+
+    def test_host_counts_fallback_from_rows(self) -> None:
+        rows = [
+            {"host": "a", "status": "success"},
+            {"host": "b", "status": "auth_error_ssh"},
+        ]
+        self.assertEqual(runner._host_counts("", rows), (1, 1))
 
 
 if __name__ == "__main__":  # pragma: no cover

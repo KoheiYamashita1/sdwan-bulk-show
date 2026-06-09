@@ -1,14 +1,45 @@
-// Shared "pick two files and diff" widget used by the index inline results,
-// the run detail page, and the standalone compare page.
+// Diff experience — the hero feature.
+//
+// Two public entry points on window.FileDiff:
+//   * init(opts)        — the "pick two files and diff" widget (index inline
+//                         results, run detail, single-run compare).
+//   * createPanel(opts) — a reusable diff panel (sticky header + stats +
+//                         toolbar + body) the cross-run compare page drives
+//                         directly with diff-across JSON.
 //
 // Security notes:
-//  * The diff is computed SERVER-SIDE (GET /api/runs/<ts>/diff). The client
-//    only ever assigns textContent (never innerHTML), so device output / diff
-//    text cannot inject markup.
-//  * Per-file "Open" posts only the filename to POST /runs/<ts>/open; the
-//    server resolves it against logs/<ts>/ with the usual path-safety.
+//   * Diffs are computed SERVER-SIDE. The client ONLY ever assigns
+//     textContent (never innerHTML), so device output / diff text cannot
+//     inject markup. Intra-line segments are rendered as nested <span>s with
+//     textContent per segment.
+//   * Per-file "Open" posts only the filename to POST /runs/<ts>/open; the
+//     server resolves it against logs/<ts>/ with the usual path-safety.
 (function () {
   "use strict";
+
+  // ---- prefs (persisted toggle state) ----------------------------------
+  var PREF = {
+    mode: "filediff.mode", // "sxs" | "unified"
+    wrap: "filediff.wrap", // "1" | "0"
+    collapse: "filediff.collapse", // "1" | "0"
+  };
+
+  function getPref(key, fallback) {
+    try {
+      var v = window.localStorage.getItem(key);
+      return v == null ? fallback : v;
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function setPref(key, value) {
+    try {
+      window.localStorage.setItem(key, value);
+    } catch (e) {
+      /* ignore private-mode failures */
+    }
+  }
 
   function el(tag, cls) {
     var node = document.createElement(tag);
@@ -18,47 +49,302 @@
     return node;
   }
 
-  // Render aligned rows as a two-column (left/right) table, tinting each side
-  // by the row tag. textContent only, so device output / diff text stays
-  // inert. `rows` come from the server (storage.build_side_by_side).
-  function renderSideBySide(bodyEl, rows) {
+  function headers(extra) {
+    return typeof window.csrfHeaders === "function"
+      ? window.csrfHeaders(extra)
+      : extra || {};
+  }
+
+  // ---- side-by-side rendering ------------------------------------------
+
+  function renderSegments(codeEl, segments, kind) {
+    // kind: "del" | "add". Render nested spans, highlighting changed runs.
+    codeEl.textContent = "";
+    segments.forEach(function (seg) {
+      if (seg.change) {
+        var span = el("span", "sxs__seg--" + kind);
+        span.textContent = seg.text;
+        codeEl.appendChild(span);
+      } else {
+        codeEl.appendChild(document.createTextNode(seg.text));
+      }
+    });
+  }
+
+  function makeCell(row, side) {
+    var num = el("td", "sxs__ln");
+    var lineNo = side === "left" ? row.ln : row.rn;
+    num.textContent = lineNo == null ? "" : String(lineNo);
+
+    var code = el("td", "sxs__code sxs__code--" + side);
+    var text = side === "left" ? row.left : row.right;
+    var tag = row.tag;
+    if (text == null) {
+      code.classList.add("sxs__code--empty");
+      return [num, code];
+    }
+    if (side === "left" && (tag === "delete" || tag === "replace")) {
+      code.classList.add("sxs__code--del");
+    } else if (side === "right" && (tag === "insert" || tag === "replace")) {
+      code.classList.add("sxs__code--add");
+    }
+    // Intra-line word/char highlighting on replace rows (C4).
+    var segs = side === "left" ? row.left_segments : row.right_segments;
+    if (tag === "replace" && Array.isArray(segs)) {
+      renderSegments(code, segs, side === "left" ? "del" : "add");
+    } else {
+      code.textContent = text;
+    }
+    return [num, code];
+  }
+
+  function appendRow(tbody, row) {
+    var tr = el("tr", "sxs__row sxs__row--" + row.tag);
+    var left = makeCell(row, "left");
+    var right = makeCell(row, "right");
+    tr.appendChild(left[0]);
+    tr.appendChild(left[1]);
+    tr.appendChild(right[0]);
+    tr.appendChild(right[1]);
+    tbody.appendChild(tr);
+  }
+
+  // Render rows into a side-by-side table; when `collapse` is on, runs of
+  // equal rows become a single "… N unchanged …" fold that expands on click.
+  function renderSideBySide(bodyEl, rows, collapse) {
     bodyEl.textContent = "";
     var table = el("table", "sxs");
     var tbody = el("tbody");
 
-    function cell(lineNo, text, side, tag) {
-      var num = el("td", "sxs__ln");
-      num.textContent = lineNo == null ? "" : String(lineNo);
-      var code = el("td", "sxs__code sxs__code--" + side);
-      if (text == null) {
-        code.classList.add("sxs__code--empty");
-      } else {
-        // A removed line tints the left side red; an added line tints the
-        // right side green; replaced lines tint both.
-        if (side === "left" && (tag === "delete" || tag === "replace")) {
-          code.classList.add("sxs__code--del");
-        } else if (side === "right" && (tag === "insert" || tag === "replace")) {
-          code.classList.add("sxs__code--add");
-        }
-        code.textContent = text;
-      }
-      return [num, code];
+    if (!collapse) {
+      rows.forEach(function (r) {
+        appendRow(tbody, r);
+      });
+      table.appendChild(tbody);
+      bodyEl.appendChild(table);
+      return;
     }
 
-    rows.forEach(function (r) {
-      var tr = el("tr", "sxs__row sxs__row--" + r.tag);
-      var left = cell(r.ln, r.left, "left", r.tag);
-      var right = cell(r.rn, r.right, "right", r.tag);
-      tr.appendChild(left[0]);
-      tr.appendChild(left[1]);
-      tr.appendChild(right[0]);
-      tr.appendChild(right[1]);
-      tbody.appendChild(tr);
-    });
+    var i = 0;
+    while (i < rows.length) {
+      if (rows[i].tag === "equal") {
+        var run = [];
+        while (i < rows.length && rows[i].tag === "equal") {
+          run.push(rows[i]);
+          i += 1;
+        }
+        if (run.length > 3) {
+          (function (groupRows) {
+            var fold = el("tr", "sxs__row sxs__row--fold");
+            var td = el("td");
+            td.colSpan = 4;
+            td.textContent = "… " + groupRows.length + " unchanged lines …";
+            fold.appendChild(td);
+            fold.addEventListener("click", function () {
+              var anchor = fold;
+              groupRows.forEach(function (r) {
+                var tr = el("tr", "sxs__row sxs__row--" + r.tag);
+                var left = makeCell(r, "left");
+                var right = makeCell(r, "right");
+                tr.appendChild(left[0]);
+                tr.appendChild(left[1]);
+                tr.appendChild(right[0]);
+                tr.appendChild(right[1]);
+                anchor.parentNode.insertBefore(tr, anchor.nextSibling);
+                anchor = tr;
+              });
+              fold.parentNode.removeChild(fold);
+            });
+            tbody.appendChild(fold);
+          })(run);
+        } else {
+          run.forEach(function (r) {
+            appendRow(tbody, r);
+          });
+        }
+      } else {
+        appendRow(tbody, rows[i]);
+        i += 1;
+      }
+    }
 
     table.appendChild(tbody);
     bodyEl.appendChild(table);
   }
+
+  // ---- unified rendering -----------------------------------------------
+
+  function classForLine(line) {
+    if (line.indexOf("@@") === 0) {
+      return "diffline--hunk";
+    }
+    if (line.indexOf("+++") === 0 || line.indexOf("---") === 0) {
+      return "diffline--hunk";
+    }
+    if (line.charAt(0) === "+") {
+      return "diffline--add";
+    }
+    if (line.charAt(0) === "-") {
+      return "diffline--del";
+    }
+    return "diffline--ctx";
+  }
+
+  function renderUnified(bodyEl, lines) {
+    bodyEl.textContent = "";
+    var pre = el("pre", "diff-unified");
+    lines.forEach(function (line) {
+      var span = el("span", "diffline " + classForLine(line));
+      span.textContent = line;
+      pre.appendChild(span);
+    });
+    bodyEl.appendChild(pre);
+  }
+
+  // ---- reusable diff panel ---------------------------------------------
+
+  function createPanel() {
+    var prefs = {
+      mode: getPref(PREF.mode, "sxs"),
+      wrap: getPref(PREF.wrap, "1") === "1",
+      collapse: getPref(PREF.collapse, "0") === "1",
+      full: false,
+    };
+    var data = null;
+
+    var panel = el("section", "filediff__panel");
+    panel.hidden = true;
+
+    var header = el("div", "filediff__header");
+    var title = el("div", "filediff__title");
+    var stats = el("span", "filediff__stats");
+    title.appendChild(stats);
+    var titleText = el("span");
+    title.appendChild(titleText);
+    header.appendChild(title);
+
+    var tools = el("div", "filediff__tools");
+    function toggleBtn(label, pressed) {
+      var b = el("button", "diff-toggle");
+      b.type = "button";
+      b.textContent = label;
+      b.setAttribute("aria-pressed", pressed ? "true" : "false");
+      return b;
+    }
+    var modeBtn = toggleBtn("Side-by-side", prefs.mode === "sxs");
+    var collapseBtn = toggleBtn("Collapse equal", prefs.collapse);
+    var wrapBtn = toggleBtn("Wrap", prefs.wrap);
+    var fullBtn = toggleBtn("Fullscreen", false);
+    tools.appendChild(modeBtn);
+    tools.appendChild(collapseBtn);
+    tools.appendChild(wrapBtn);
+    tools.appendChild(fullBtn);
+    header.appendChild(tools);
+
+    var body = el("div", "filediff__body");
+    panel.appendChild(header);
+    panel.appendChild(body);
+
+    function renderStats() {
+      stats.textContent = "";
+      var s = (data && data.stats) || {};
+      var add = el("span", "filediff__stat--add");
+      add.textContent = "+" + (s.added || 0);
+      var del = el("span", "filediff__stat--del");
+      del.textContent = "\u2212" + (s.removed || 0);
+      var chg = el("span", "filediff__stat--chg");
+      chg.textContent = "~" + (s.changed || 0);
+      stats.appendChild(add);
+      stats.appendChild(del);
+      stats.appendChild(chg);
+    }
+
+    function renderBody() {
+      body.classList.toggle("filediff__body--nowrap", !prefs.wrap);
+      if (!data) {
+        return;
+      }
+      if (data.identical) {
+        body.textContent = "";
+        var note = el("p", "filediff__identical");
+        note.textContent = "Files are identical.";
+        body.appendChild(note);
+        return;
+      }
+      if (prefs.mode === "unified") {
+        renderUnified(body, data.diff || []);
+      } else {
+        renderSideBySide(body, data.rows || [], prefs.collapse);
+      }
+    }
+
+    modeBtn.addEventListener("click", function () {
+      prefs.mode = prefs.mode === "sxs" ? "unified" : "sxs";
+      setPref(PREF.mode, prefs.mode);
+      modeBtn.textContent = prefs.mode === "sxs" ? "Side-by-side" : "Unified";
+      modeBtn.setAttribute("aria-pressed", prefs.mode === "sxs" ? "true" : "false");
+      collapseBtn.disabled = prefs.mode === "unified";
+      renderBody();
+    });
+    modeBtn.textContent = prefs.mode === "sxs" ? "Side-by-side" : "Unified";
+    collapseBtn.disabled = prefs.mode === "unified";
+
+    collapseBtn.addEventListener("click", function () {
+      prefs.collapse = !prefs.collapse;
+      setPref(PREF.collapse, prefs.collapse ? "1" : "0");
+      collapseBtn.setAttribute("aria-pressed", prefs.collapse ? "true" : "false");
+      renderBody();
+    });
+
+    wrapBtn.addEventListener("click", function () {
+      prefs.wrap = !prefs.wrap;
+      setPref(PREF.wrap, prefs.wrap ? "1" : "0");
+      wrapBtn.setAttribute("aria-pressed", prefs.wrap ? "true" : "false");
+      renderBody();
+    });
+
+    function setFull(on) {
+      prefs.full = on;
+      panel.classList.toggle("filediff__panel--full", on);
+      fullBtn.setAttribute("aria-pressed", on ? "true" : "false");
+    }
+
+    function onKey(e) {
+      if (e.key === "Escape" && prefs.full) {
+        setFull(false);
+      }
+    }
+
+    fullBtn.addEventListener("click", function () {
+      setFull(!prefs.full);
+    });
+    document.addEventListener("keydown", onKey);
+
+    return {
+      el: panel,
+      update: function (newData) {
+        data = newData;
+        panel.hidden = false;
+        titleText.textContent = " " + (data.a || "") + " \u2194 " + (data.b || "");
+        renderStats();
+        renderBody();
+        return panel;
+      },
+      showSkeleton: function () {
+        panel.hidden = false;
+        titleText.textContent = " loading…";
+        stats.textContent = "";
+        body.textContent = "";
+        var sk = el("div", "skeleton");
+        for (var i = 0; i < 4; i += 1) {
+          sk.appendChild(el("div", "skeleton__line"));
+        }
+        body.appendChild(sk);
+      },
+    };
+  }
+
+  // ---- pick-two-and-diff widget ----------------------------------------
 
   function init(opts) {
     var container = opts && opts.container;
@@ -98,8 +384,6 @@
     function onChange() {
       var sel = selected();
       var atMax = sel.length >= 2;
-      // Disabling the remaining checkboxes once two are picked is the cleaner
-      // UX than silently auto-unchecking the oldest selection.
       checkboxes.forEach(function (cb) {
         cb.disabled = atMax && !cb.checked;
       });
@@ -113,10 +397,10 @@
       }
       fetch("/runs/" + encodeURIComponent(timestamp) + "/open", {
         method: "POST",
-        headers: {
+        headers: headers({
           "Content-Type": "application/json",
           "X-Requested-With": "XMLHttpRequest",
-        },
+        }),
         body: JSON.stringify({ name: name }),
       })
         .then(function (resp) {
@@ -156,7 +440,7 @@
       label.appendChild(nameSpan);
       row.appendChild(label);
 
-      var openBtn = el("button", "button button--ghost filelist__open");
+      var openBtn = el("button", "button button--ghost button--sm filelist__open");
       openBtn.type = "button";
       openBtn.textContent = "Open";
       openBtn.addEventListener("click", function () {
@@ -178,13 +462,15 @@
     actions.appendChild(hint);
     container.appendChild(actions);
 
-    var panel = el("section", "filediff__panel");
-    panel.hidden = true;
-    var header = el("div", "filediff__header");
-    var body = el("div", "filediff__body");
-    panel.appendChild(header);
-    panel.appendChild(body);
-    container.appendChild(panel);
+    var panel = createPanel();
+    container.appendChild(panel.el);
+
+    // Auto-select when exactly two files exist: pre-check both, enable Diff.
+    if (checkboxes.length === 2) {
+      checkboxes[0].checked = true;
+      checkboxes[1].checked = true;
+      onChange();
+    }
 
     diffBtn.addEventListener("click", function () {
       var sel = selected();
@@ -194,10 +480,11 @@
       var a = sel[0].value;
       var b = sel[1].value;
       setHint("Diffing…", false);
+      panel.showSkeleton();
       fetch(
         "/api/runs/" + encodeURIComponent(timestamp) + "/diff?a=" +
           encodeURIComponent(a) + "&b=" + encodeURIComponent(b),
-        { headers: { Accept: "application/json" }, cache: "no-store" }
+        { headers: headers({ Accept: "application/json" }), cache: "no-store" }
       )
         .then(function (resp) {
           return resp.json().then(function (data) {
@@ -209,23 +496,13 @@
             setHint((res.data && res.data.error) || "Diff failed.", true);
             return;
           }
-          var data = res.data;
-          panel.hidden = false;
-          header.textContent = data.a + " \u2194 " + data.b;
-          if (data.identical) {
-            body.textContent = "";
-            var note = el("p", "filediff__identical");
-            note.textContent = "Files are identical.";
-            body.appendChild(note);
-          } else {
-            renderSideBySide(body, data.rows || []);
-          }
+          panel.update(res.data);
           var trunc = [];
-          if (data.a_truncated) {
-            trunc.push(data.a);
+          if (res.data.a_truncated) {
+            trunc.push(res.data.a);
           }
-          if (data.b_truncated) {
-            trunc.push(data.b);
+          if (res.data.b_truncated) {
+            trunc.push(res.data.b);
           }
           setHint(trunc.length ? "truncated: " + trunc.join(", ") : "", false);
         })
@@ -235,5 +512,5 @@
     });
   }
 
-  window.FileDiff = { init: init };
+  window.FileDiff = { init: init, createPanel: createPanel };
 })();

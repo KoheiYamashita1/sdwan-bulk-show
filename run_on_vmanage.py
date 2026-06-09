@@ -3,6 +3,7 @@ import getpass
 import os
 import pathlib
 import re
+import shlex
 import sys
 import time
 
@@ -123,7 +124,44 @@ def parse_args():
         "--reject-unknown-hosts",
         action="store_true",
         help="Reject the SSH connection if the vManage host key is not in known_hosts "
-             "(safer; protects against MITM). Default: auto-add unknown keys.",
+             "(safer; protects against MITM). Default: auto-add unknown keys. "
+             "Also forwarded to the remote bulk-show.py so edge/controller SSH "
+             "from vManage is strict too.",
+    )
+    # bulk-show.py knobs forwarded to the remote invocation (Wave 1 C3).
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help="Forwarded to bulk-show.py --retries: extra SSH connect attempts "
+             "after a transient failure (default: 0).",
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=5.0,
+        help="Forwarded to bulk-show.py --retry-delay: seconds between connect "
+             "attempts (default: 5.0).",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Forwarded to bulk-show.py --max-workers: max concurrent SSH "
+             "sessions (default: bulk-show.py's own default).",
+    )
+    parser.add_argument(
+        "--controller-port",
+        type=int,
+        default=22,
+        help="Forwarded to bulk-show.py --controller-port: SSH port for hosts "
+             "marked as controllers (default: 22).",
+    )
+    parser.add_argument(
+        "--output-format",
+        default=None,
+        help="Forwarded to bulk-show.py --output-format: comma-separated "
+             "per-host formats (text,json,csv). Default: bulk-show.py's own.",
     )
     parser.add_argument(
         "--quiet",
@@ -314,17 +352,36 @@ def main():
         sftp.close()
 
     remote_logs_dir = f"{remote_dir}/logs"
+    # Every path is shlex.quote()d before it lands in the vshell command string
+    # (defence-in-depth, A2): even a surprising --remote-dir value can't break
+    # out of its argument and inject a second shell command.
     remote_cmd = (
-        f"python3 {remote_dir}/{bulk_script.name} "
-        f"{remote_dir}/{hosts_file.name} {remote_dir}/{commands_file.name} "
-        f"--logs-dir {remote_logs_dir}"
+        f"python3 {shlex.quote(f'{remote_dir}/{bulk_script.name}')} "
+        f"{shlex.quote(f'{remote_dir}/{hosts_file.name}')} "
+        f"{shlex.quote(f'{remote_dir}/{commands_file.name}')} "
+        f"--logs-dir {shlex.quote(remote_logs_dir)}"
     )
     if controller_commands_file is not None:
         remote_cmd += (
-            f" --controller-commands {remote_dir}/{controller_commands_file.name}"
+            " --controller-commands "
+            f"{shlex.quote(f'{remote_dir}/{controller_commands_file.name}')}"
         )
     if edge_commands_file is not None:
-        remote_cmd += f" --edge-commands {remote_dir}/{edge_commands_file.name}"
+        remote_cmd += (
+            " --edge-commands "
+            f"{shlex.quote(f'{remote_dir}/{edge_commands_file.name}')}"
+        )
+    # Forward the wired-through knobs (C3) and the strict host-key flag (A5).
+    if args.retries:
+        remote_cmd += f" --retries {shlex.quote(str(args.retries))}"
+        remote_cmd += f" --retry-delay {shlex.quote(str(args.retry_delay))}"
+    if args.max_workers is not None:
+        remote_cmd += f" --max-workers {shlex.quote(str(args.max_workers))}"
+    remote_cmd += f" --controller-port {shlex.quote(str(args.controller_port))}"
+    if args.output_format:
+        remote_cmd += f" --output-format {shlex.quote(args.output_format)}"
+    if args.reject_unknown_hosts:
+        remote_cmd += " --reject-unknown-hosts"
     if not args.quiet:
         log(f"[{args.vmanage_host}] running via vshell session")
     shell = ssh.invoke_shell()
@@ -386,9 +443,14 @@ def main():
                     entries = sftp.listdir(remote_dir)
                     remote_source = remote_dir
                 if not args.quiet:
-                    log(f"[{args.vmanage_host}] downloading output_*.txt -> {local_logs_dir}")
+                    log(
+                        f"[{args.vmanage_host}] downloading "
+                        f"output_*.{{txt,json,csv}} -> {local_logs_dir}"
+                    )
                 for entry in entries:
-                    if entry.startswith("output_") and entry.endswith(".txt"):
+                    if entry.startswith("output_") and entry.endswith(
+                        (".txt", ".json", ".csv")
+                    ):
                         local_path = local_logs_dir / entry
                         sftp.get(f"{remote_source}/{entry}", str(local_path))
             finally:

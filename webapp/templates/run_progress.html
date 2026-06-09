@@ -1,7 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Running… · sdwan-bulk-show{% endblock %}
+{% block breadcrumb %}
+  <nav class="breadcrumb" aria-label="Breadcrumb">
+    <a href="/">Run</a><span class="breadcrumb__sep">/</span>
+    <a href="/runs">Runs</a><span class="breadcrumb__sep">/</span>
+    <span>In progress</span>
+  </nav>
+{% endblock %}
 {% block content %}
-  <p><a href="/runs">← Past runs</a></p>
   <h1>Run in progress</h1>
 
   {% if job is none %}
@@ -19,16 +25,25 @@
     </noscript>
 
     <section class="card">
+      <div class="progress__head">
+        <h2 style="margin:0">Progress</h2>
+        <div class="progress__head-actions">
+          <span class="progress__percent" id="percent">{{ job.percent }}%</span>
+          <button type="button" class="button button--danger button--sm" id="cancel-btn">Cancel</button>
+        </div>
+      </div>
+
       <div class="progress" id="progress-wrap" data-status="{{ job.status }}">
+        <ol class="stepper" id="stepper" aria-label="Run phases"></ol>
         <div class="progress__head">
           <span class="progress__phase" id="phase">{{ job.phase }}</span>
-          <span class="progress__percent" id="percent">{{ job.percent }}%</span>
         </div>
         <progress class="progress__bar" id="bar" max="100"
                   value="{{ job.percent }}">{{ job.percent }}%</progress>
         <div class="progress__meta">
           <span>status: <span class="status status--{{ job.status }}" id="status">{{ job.status }}</span></span>
-          <span id="counters">commands {{ job.commands_done }} / {{ job.commands_total }}</span>
+          <span class="tnum" id="counters">commands {{ job.commands_done }} / {{ job.commands_total }}</span>
+          <span class="tnum" id="hosts">hosts {{ job.hosts_total }}</span>
         </div>
         <p class="progress__message" id="message">{{ job.message }}</p>
       </div>
@@ -39,70 +54,54 @@
       </div>
     </section>
 
-    <section class="card">
-      <h2>Live log <small class="progress__note">(last {{ job.log_tail|length }} lines, password masked)</small></h2>
+    <details class="logpanel" id="log-panel" open>
+      <summary>
+        Live log <span class="progress__note">(last {{ job.log_tail|length }} lines, password masked)</span>
+        <span class="logpanel__actions">
+          <button type="button" class="button button--ghost button--sm" id="copy-log-btn">Copy log</button>
+        </span>
+      </summary>
       <pre class="filebox" id="log-tail">{% for line in job.log_tail %}{{ line }}
 {% endfor %}</pre>
-    </section>
+    </details>
   {% endif %}
 {% endblock %}
 
 {% block scripts %}
 {% if job is not none %}
+<script src="/static/open-actions.js?v={{ asset_version }}"></script>
+<script src="/static/progress-ui.js?v={{ asset_version }}"></script>
 <script>
-  // Poll the JSON progress endpoint and reflect it in the DOM. We only ever
-  // touch textContent / element.value (never innerHTML) so masked log lines
-  // cannot inject markup.
+  // Poll the JSON progress endpoint and reflect it via the shared stepper UI.
+  // textContent / element.value only (masked log can't inject markup).
   (function () {
     "use strict";
 
     var JOB_ID = {{ job_id | tojson }};
     var POLL_MS = 1000;
 
-    var bar = document.getElementById("bar");
-    var percentEl = document.getElementById("percent");
-    var phaseEl = document.getElementById("phase");
-    var statusEl = document.getElementById("status");
-    var countersEl = document.getElementById("counters");
-    var messageEl = document.getElementById("message");
-    var logEl = document.getElementById("log-tail");
-    var wrap = document.getElementById("progress-wrap");
+    var els = {
+      wrap: document.getElementById("progress-wrap"),
+      bar: document.getElementById("bar"),
+      percent: document.getElementById("percent"),
+      phase: document.getElementById("phase"),
+      status: document.getElementById("status"),
+      counters: document.getElementById("counters"),
+      hosts: document.getElementById("hosts"),
+      message: document.getElementById("message"),
+      log: document.getElementById("log-tail"),
+      stepper: document.getElementById("stepper"),
+    };
     var resultBox = document.getElementById("result");
     var resultLink = document.getElementById("result-link");
     var resultNote = document.getElementById("result-note");
-
-    function render(data) {
-      var pct = typeof data.percent === "number" ? data.percent : 0;
-      if (bar) {
-        bar.value = pct;
-      }
-      if (percentEl) {
-        percentEl.textContent = pct + "%";
-      }
-      if (phaseEl) {
-        phaseEl.textContent = data.phase || "";
-      }
-      if (statusEl) {
-        statusEl.textContent = data.status || "";
-        statusEl.className = "status status--" + (data.status || "unknown");
-      }
-      if (wrap) {
-        wrap.setAttribute("data-status", data.status || "running");
-      }
-      if (countersEl) {
-        countersEl.textContent =
-          "commands " + (data.commands_done || 0) + " / " + (data.commands_total || 0);
-      }
-      if (messageEl) {
-        messageEl.textContent = data.message || "";
-      }
-      if (logEl && Array.isArray(data.log_tail)) {
-        logEl.textContent = data.log_tail.join("\n");
-        logEl.scrollTop = logEl.scrollHeight;
-      }
-    }
+    var cancelBtn = document.getElementById("cancel-btn");
+    var copyLogBtn = document.getElementById("copy-log-btn");
 
     function finish(data) {
+      if (cancelBtn) {
+        cancelBtn.hidden = true;
+      }
       if (resultBox) {
         resultBox.hidden = false;
       }
@@ -121,12 +120,40 @@
           resultNote.textContent = "Finished (" + data.status + ").";
         }
       }
-      // Gentle auto-redirect on success so the user lands on full results.
       if (data.status === "success" && data.timestamp) {
         window.setTimeout(function () {
           window.location.href = "/runs/" + data.timestamp;
         }, 1500);
       }
+    }
+
+    if (cancelBtn) {
+      cancelBtn.addEventListener("click", function () {
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = "Cancelling…";
+        fetch("/api/runs/" + encodeURIComponent(JOB_ID) + "/cancel", {
+          method: "POST",
+          headers: window.csrfHeaders({ "X-Requested-With": "XMLHttpRequest" }),
+        })
+          .then(function (resp) { return resp.json(); })
+          .then(function () {
+            if (window.toast) { window.toast("Cancellation requested.", "ok"); }
+          })
+          .catch(function () {
+            if (window.toast) { window.toast("Could not request cancel.", "error"); }
+          });
+      });
+    }
+
+    if (copyLogBtn) {
+      copyLogBtn.addEventListener("click", function () {
+        var text = els.log ? els.log.textContent : "";
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function () {
+            if (window.toast) { window.toast("Log copied.", "ok"); }
+          });
+        }
+      });
     }
 
     function poll() {
@@ -141,19 +168,25 @@
           return resp.json();
         })
         .then(function (data) {
-          render(data);
+          window.ProgressUI.applyProgress(els, data);
           if (data.status && data.status !== "running") {
             finish(data);
-            return; // stop polling
+            return;
           }
           window.setTimeout(poll, POLL_MS);
         })
         .catch(function () {
-          // Transient error (server busy / restart): back off and retry.
           window.setTimeout(poll, POLL_MS * 2);
         });
     }
 
+    // Paint the initial server-rendered state into the stepper immediately.
+    window.ProgressUI.renderStepper(
+      els.stepper,
+      {{ job.phase | tojson }},
+      {{ job.status | tojson }},
+      {{ job.percent }}
+    );
     window.setTimeout(poll, POLL_MS);
   })();
 </script>

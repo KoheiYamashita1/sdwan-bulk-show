@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -31,7 +32,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import runner, storage
+from . import runner, security, storage
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,10 @@ TEMPLATES_DIR = WEBAPP_DIR / "templates"
 STATIC_DIR = WEBAPP_DIR / "static"
 
 DEFAULT_REMOTE_DIR = "/home/admin"
+
+# Files the per-file "Open" action is allowed to launch (A3). Anything else
+# (even if it resolves safely inside the run dir) is refused with 403.
+OPEN_NAME_RE = re.compile(r"^(?:output_.+|run\.log|manifest\.json)$")
 
 app = FastAPI(
     title="sdwan-bulk-show Web UI",
@@ -62,6 +67,11 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 # CSS/JS instead of serving a stale cached copy. Templates append
 # ``?v={{ asset_version }}`` to /static URLs.
 templates.env.globals["asset_version"] = int(time.time())
+
+# Optional bearer-token surface for the CSRF guard. Default off; when
+# ``WEBAPP_TOKEN`` is set the base template renders a ``<meta name=
+# "webapp-token">`` the client forwards as ``X-Webapp-Token`` on POSTs.
+templates.env.globals["webapp_token"] = os.environ.get("WEBAPP_TOKEN", "")
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +115,13 @@ def submit_run(
     download_outputs: Optional[str] = Form(None),
     verbose: Optional[str] = Form(None),
     reject_unknown_hosts: Optional[str] = Form(None),
+    # bulk-show.py knobs wired end to end (C3). Accepted as strings so a
+    # malformed value yields a friendly 400 instead of FastAPI's raw 422.
+    # ``output_formats`` is a repeated form field (one per checked box).
+    retries: str = Form("0"),
+    max_workers: str = Form(""),
+    output_formats: list[str] = Form([]),
+    controller_port: str = Form("22"),
 ):
     """Receive the form and kick off ``run_on_vmanage.py`` asynchronously.
 
@@ -119,6 +136,45 @@ def submit_run(
       submitted (non-secret) values on error.
     """
 
+    guard = security.state_change_error(request)
+    if guard is not None:
+        return guard
+
+    wants_json = _wants_json(request)
+
+    # Normalise the output formats: drop blanks, default to text-only so a
+    # submission that somehow clears every box still validates.
+    formats = [fmt.strip() for fmt in output_formats if fmt and fmt.strip()]
+    if not formats:
+        formats = ["text"]
+
+    # Parse the numeric knobs defensively: an empty ``max_workers`` means
+    # "auto" (None); anything non-numeric is a friendly 400, not a 422.
+    try:
+        parsed_retries = _parse_int(retries, "retries", default=0)
+        parsed_controller_port = _parse_int(
+            controller_port, "controller port", default=22
+        )
+        parsed_max_workers = _parse_optional_int(max_workers, "max workers")
+    except runner.RunInputError as exc:
+        bad_form = runner.RunForm(
+            vmanage_host=vmanage_host.strip(),
+            user=user.strip(),
+            password="",
+            remote_dir=remote_dir.strip() or DEFAULT_REMOTE_DIR,
+            hosts_text=hosts_text,
+            commands_text=commands_text,
+            controller_commands_text=controller_commands_text,
+            edge_commands_text=edge_commands_text,
+            download_outputs=_checkbox(download_outputs),
+            verbose=_checkbox(verbose),
+            reject_unknown_hosts=_checkbox(reject_unknown_hosts),
+            output_formats=formats,
+        )
+        return _run_error(
+            request, bad_form, str(exc), status.HTTP_400_BAD_REQUEST, wants_json
+        )
+
     form = runner.RunForm(
         vmanage_host=vmanage_host.strip(),
         user=user.strip(),
@@ -131,9 +187,12 @@ def submit_run(
         download_outputs=_checkbox(download_outputs),
         verbose=_checkbox(verbose),
         reject_unknown_hosts=_checkbox(reject_unknown_hosts),
+        retries=parsed_retries,
+        max_workers=parsed_max_workers,
+        output_formats=formats,
+        controller_port=parsed_controller_port,
     )
 
-    wants_json = _wants_json(request)
     try:
         job_id = runner.start_run_async(form)
     except runner.RunInputError as exc:
@@ -197,6 +256,40 @@ def runs_list(request: Request) -> HTMLResponse:
         request,
         "runs_list.html",
         {"runs": runs},
+    )
+
+
+@app.get("/runs/compare-across", response_class=HTMLResponse)
+def compare_across(
+    request: Request,
+    a: Optional[str] = None,
+    b: Optional[str] = None,
+) -> HTMLResponse:
+    """Cross-run compare view: diff one host across two runs (C2).
+
+    Declared BEFORE ``/runs/{timestamp}`` so the literal path is not captured
+    as a timestamp. When both ``a`` and ``b`` are supplied they must resolve
+    to real run dirs (404 otherwise). The page itself is JS-driven: it calls
+    ``/api/runs/common-hosts`` to list hosts present in both runs and renders
+    ``/api/runs/diff-across`` with the shared diff renderer. With no params it
+    renders an empty-state prompt to pick two runs from the history.
+    """
+
+    if a and b:
+        try:
+            storage.safe_run_dir(a)
+            storage.safe_run_dir(b)
+        except storage.StorageError as exc:
+            return templates.TemplateResponse(
+                request,
+                "run_compare_across.html",
+                {"a": a, "b": b, "error": str(exc)},
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+    return templates.TemplateResponse(
+        request,
+        "run_compare_across.html",
+        {"a": a, "b": b, "error": None},
     )
 
 
@@ -363,6 +456,10 @@ async def open_run_dir(request: Request, timestamp: str) -> JSONResponse:
     (404/400) are returned regardless of platform.
     """
 
+    guard = security.state_change_error(request)
+    if guard is not None:
+        return guard
+
     target, name = await _extract_open_fields(request)
 
     # Resolve (and thereby validate) the run dir first so a bad timestamp is a
@@ -382,6 +479,13 @@ async def open_run_dir(request: Request, timestamp: str) -> JSONResponse:
         except storage.StorageError as exc:
             return JSONResponse(
                 {"error": str(exc)}, status_code=status.HTTP_404_NOT_FOUND
+            )
+        # Even a path-safe name must be on the open allow-list (A3): only the
+        # per-host outputs, the run log, and the manifest may be launched.
+        if not OPEN_NAME_RE.match(name):
+            return JSONResponse(
+                {"error": f"file {name!r} is not openable."},
+                status_code=status.HTTP_403_FORBIDDEN,
             )
         argv = ["open", str(file_path)]
         what = f"file {name}"
@@ -416,9 +520,90 @@ async def open_run_dir(request: Request, timestamp: str) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+@app.post("/api/runs/{job_id}/cancel")
+def cancel_run(request: Request, job_id: str) -> JSONResponse:
+    """Cancel an in-flight run (C1).
+
+    ``{"ok": true, "status": "cancelled"}`` when the job exists (running jobs
+    are killed; already-finished jobs report their terminal status); ``404``
+    ``{"error": ...}`` for an unknown ``job_id``. Subject to the CSRF guard.
+    """
+
+    guard = security.state_change_error(request)
+    if guard is not None:
+        return guard
+
+    result = runner.request_cancel(job_id)
+    if result is None:
+        return JSONResponse(
+            {"error": "unknown job_id"}, status_code=status.HTTP_404_NOT_FOUND
+        )
+    return JSONResponse({"ok": True, "status": result})
+
+
+@app.get("/api/runs/common-hosts")
+def api_common_hosts(a: str, b: str) -> JSONResponse:
+    """Host IPs that have an ``output_*`` file in BOTH runs ``a`` and ``b`` (C2).
+
+    ``{"a": <ts>, "b": <ts>, "hosts": [...]}`` on success; ``404`` if either
+    run is unknown/unsafe.
+    """
+
+    try:
+        hosts = storage.common_hosts(a, b)
+    except storage.StorageError as exc:
+        return JSONResponse(
+            {"error": str(exc)}, status_code=status.HTTP_404_NOT_FOUND
+        )
+    return JSONResponse({"a": a, "b": b, "hosts": hosts})
+
+
+@app.get("/api/runs/diff-across")
+def api_diff_across(a: str, b: str, host: str) -> JSONResponse:
+    """Diff one host's text output across two runs (C2).
+
+    Same JSON shape as ``GET /api/runs/{ts}/diff`` (``a``/``b`` labels carry
+    the run timestamp) plus additive ``a_run`` / ``b_run`` / ``host`` fields.
+    Returns ``404`` when the host has no output in a run or a run is
+    unknown/unsafe.
+    """
+
+    try:
+        payload = storage.diff_across_runs(a, b, host)
+    except storage.StorageError as exc:
+        return JSONResponse(
+            {"error": str(exc)}, status_code=status.HTTP_404_NOT_FOUND
+        )
+    return JSONResponse(payload)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _parse_int(value: str, label: str, *, default: int) -> int:
+    """Parse a form string to int with a friendly error (blank -> default)."""
+
+    text = (value or "").strip()
+    if not text:
+        return default
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise runner.RunInputError(f"{label} must be a whole number.") from exc
+
+
+def _parse_optional_int(value: str, label: str) -> Optional[int]:
+    """Parse a form string to ``Optional[int]`` (blank -> None / auto)."""
+
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise runner.RunInputError(f"{label} must be blank or a whole number.") from exc
 
 
 def _checkbox(value: Optional[str]) -> bool:
@@ -514,6 +699,10 @@ def _render_index_error(
                 "download_outputs": form.download_outputs,
                 "verbose": form.verbose,
                 "reject_unknown_hosts": form.reject_unknown_hosts,
+                "retries": form.retries,
+                "max_workers": form.max_workers,
+                "output_formats": list(form.output_formats),
+                "controller_port": form.controller_port,
             },
             "error": error,
         },

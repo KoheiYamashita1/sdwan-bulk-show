@@ -1,0 +1,159 @@
+{% extends "base.html" %}
+{% block title %}Compare across runs · sdwan-bulk-show{% endblock %}
+{% block breadcrumb %}
+  <nav class="breadcrumb" aria-label="Breadcrumb">
+    <a href="/runs">Runs</a><span class="breadcrumb__sep">/</span>
+    <span>Compare across runs</span>
+  </nav>
+{% endblock %}
+{% block content %}
+  <h1>Compare a host across two runs</h1>
+
+  {% if error %}
+    <div class="alert alert--error" role="alert">
+      <strong>Error:</strong> {{ error }}
+    </div>
+  {% endif %}
+
+  <p class="lede">
+    Diff one device's <code>output_*.txt</code> between two runs. Enter the two
+    run timestamps (or pick two on the <a href="/runs">Past runs</a> page), then
+    choose a host common to both.
+  </p>
+
+  <form class="toolbar" id="across-form">
+    <label class="field" style="flex:1 1 12rem">
+      <span>Run A</span>
+      <input type="text" id="run-a" name="a" spellcheck="false"
+             placeholder="YYYYMMDD_HHMMSS" value="{{ a or '' }}">
+    </label>
+    <label class="field" style="flex:1 1 12rem">
+      <span>Run B</span>
+      <input type="text" id="run-b" name="b" spellcheck="false"
+             placeholder="YYYYMMDD_HHMMSS" value="{{ b or '' }}">
+    </label>
+    <button type="submit" class="button">Load common hosts</button>
+  </form>
+
+  <section class="card" id="across-panel" {% if not (a and b) %}hidden{% endif %}>
+    <h2>Common hosts</h2>
+    <span class="toolbar__hint" id="across-hint" role="status" aria-live="polite"></span>
+    <div class="hostpick" id="hostpick"></div>
+    <div class="filediff" id="across-diff"></div>
+  </section>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/open-actions.js?v={{ asset_version }}"></script>
+<script src="/static/filediff.js?v={{ asset_version }}"></script>
+<script>
+  (function () {
+    "use strict";
+
+    var A = {{ (a or '') | tojson }};
+    var B = {{ (b or '') | tojson }};
+
+    var formEl = document.getElementById("across-form");
+    var panel = document.getElementById("across-panel");
+    var hint = document.getElementById("across-hint");
+    var hostpick = document.getElementById("hostpick");
+    var diffContainer = document.getElementById("across-diff");
+
+    // Navigate (server validates the run dirs) when the user submits.
+    formEl.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var a = document.getElementById("run-a").value.trim();
+      var b = document.getElementById("run-b").value.trim();
+      if (!a || !b) {
+        if (hint) { hint.textContent = "Enter both run timestamps."; hint.classList.add("toolbar__hint--error"); }
+        return;
+      }
+      window.location.href = "/runs/compare-across?a=" +
+        encodeURIComponent(a) + "&b=" + encodeURIComponent(b);
+    });
+
+    if (!A || !B) {
+      return;
+    }
+
+    function setHint(text, isError) {
+      if (hint) {
+        hint.textContent = text || "";
+        hint.classList.toggle("toolbar__hint--error", Boolean(isError));
+      }
+    }
+
+    var diffPanel = window.FileDiff.createPanel();
+    diffContainer.appendChild(diffPanel.el);
+
+    function loadDiff(host, chip) {
+      Array.prototype.forEach.call(hostpick.children, function (c) {
+        c.setAttribute("aria-pressed", c === chip ? "true" : "false");
+      });
+      setHint("Diffing " + host + "…", false);
+      diffPanel.showSkeleton();
+      fetch(
+        "/api/runs/diff-across?a=" + encodeURIComponent(A) +
+          "&b=" + encodeURIComponent(B) + "&host=" + encodeURIComponent(host),
+        { headers: window.csrfHeaders({ Accept: "application/json" }), cache: "no-store" }
+      )
+        .then(function (resp) {
+          return resp.json().then(function (data) {
+            return { ok: resp.ok, data: data };
+          });
+        })
+        .then(function (res) {
+          if (!res.ok || !res.data) {
+            setHint((res.data && res.data.error) || "Diff failed.", true);
+            return;
+          }
+          diffPanel.update(res.data);
+          var trunc = [];
+          if (res.data.a_truncated) { trunc.push(res.data.a); }
+          if (res.data.b_truncated) { trunc.push(res.data.b); }
+          setHint(trunc.length ? "truncated: " + trunc.join(", ") : "", false);
+        })
+        .catch(function () {
+          setHint("Could not reach the server.", true);
+        });
+    }
+
+    setHint("Loading common hosts…", false);
+    fetch(
+      "/api/runs/common-hosts?a=" + encodeURIComponent(A) +
+        "&b=" + encodeURIComponent(B),
+      { headers: window.csrfHeaders({ Accept: "application/json" }), cache: "no-store" }
+    )
+      .then(function (resp) {
+        return resp.json().then(function (data) {
+          return { ok: resp.ok, data: data };
+        });
+      })
+      .then(function (res) {
+        if (!res.ok || !res.data) {
+          setHint((res.data && res.data.error) || "Could not load hosts.", true);
+          return;
+        }
+        var hosts = (res.data && res.data.hosts) || [];
+        hostpick.textContent = "";
+        if (!hosts.length) {
+          setHint("No hosts have output_*.txt in BOTH runs.", false);
+          return;
+        }
+        setHint(hosts.length + " common host(s). Pick one.", false);
+        hosts.forEach(function (host) {
+          var chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = "hostpick__chip";
+          chip.setAttribute("aria-pressed", "false");
+          chip.textContent = host;
+          chip.addEventListener("click", function () { loadDiff(host, chip); });
+          hostpick.appendChild(chip);
+        });
+      })
+      .catch(function () {
+        setHint("Could not reach the server.", true);
+      });
+  })();
+</script>
+{% endblock %}

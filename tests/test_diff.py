@@ -73,6 +73,17 @@ class BuildUnifiedDiffTests(unittest.TestCase):
         self.assertEqual(tags[0], "equal")
         self.assertIn("replace", tags)
 
+    def test_payload_includes_stats(self) -> None:
+        # alpha (equal), bravo->charlie (replace), delta (delete), echo (insert)
+        payload = storage.build_unified_diff(
+            "a.txt", "alpha\nbravo\ndelta\n", "b.txt", "alpha\ncharlie\necho\n"
+        )
+        self.assertIn("stats", payload)
+        stats = payload["stats"]
+        self.assertEqual(set(stats), {"added", "removed", "changed", "unchanged"})
+        self.assertEqual(stats["unchanged"], 1)
+        self.assertGreaterEqual(stats["changed"], 1)
+
 
 class BuildSideBySideTests(unittest.TestCase):
     def test_equal_lines_pair_left_and_right(self) -> None:
@@ -109,6 +120,37 @@ class BuildSideBySideTests(unittest.TestCase):
         self.assertEqual(rows[0]["tag"], "replace")
         self.assertEqual(rows[1]["tag"], "insert")
         self.assertEqual(rows[1]["right"], "c")
+
+    def test_replace_rows_carry_intra_line_segments(self) -> None:
+        # "ip mtu 1500" -> "ip mtu 9000": the shared prefix is unchanged, the
+        # number is the changed segment.
+        rows = storage.build_side_by_side(["ip mtu 1500"], ["ip mtu 9000"])
+        self.assertEqual(rows[0]["tag"], "replace")
+        self.assertIn("left_segments", rows[0])
+        self.assertIn("right_segments", rows[0])
+        # Reassembling the segments reproduces the original line text.
+        self.assertEqual(
+            "".join(seg["text"] for seg in rows[0]["left_segments"]), "ip mtu 1500"
+        )
+        self.assertEqual(
+            "".join(seg["text"] for seg in rows[0]["right_segments"]), "ip mtu 9000"
+        )
+        # There is at least one unchanged run and one changed run per side.
+        self.assertTrue(any(not s["change"] for s in rows[0]["left_segments"]))
+        self.assertTrue(any(s["change"] for s in rows[0]["right_segments"]))
+
+    def test_equal_rows_have_no_segments(self) -> None:
+        rows = storage.build_side_by_side(["same"], ["same"])
+        self.assertNotIn("left_segments", rows[0])
+        self.assertNotIn("right_segments", rows[0])
+
+    def test_very_long_lines_skip_segments(self) -> None:
+        long_a = "x" * (storage.MAX_SEGMENT_LINE_LEN + 1)
+        long_b = "y" * (storage.MAX_SEGMENT_LINE_LEN + 1)
+        rows = storage.build_side_by_side([long_a], [long_b])
+        self.assertEqual(rows[0]["tag"], "replace")
+        # Over the cap: base row shape is preserved but no segments are added.
+        self.assertNotIn("left_segments", rows[0])
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +233,8 @@ class OpenEndpointInputTests(unittest.TestCase):
         run_dir = sandbox / "logs" / TS
         run_dir.mkdir(parents=True)
         (run_dir / "output_a.txt").write_text("alpha\n", encoding="utf-8")
+        # A path-safe file that is NOT on the open allow-list (A3).
+        (run_dir / "notes.txt").write_text("secret-ish\n", encoding="utf-8")
 
         self._orig_logs = storage.LOGS_DIR
         storage.LOGS_DIR = sandbox / "logs"
@@ -223,6 +267,27 @@ class OpenEndpointInputTests(unittest.TestCase):
             headers={"X-Requested-With": "XMLHttpRequest"},
         )
         self.assertEqual(r.status_code, 404)
+
+    def test_disallowed_but_path_safe_name_is_403(self) -> None:
+        # notes.txt resolves safely inside the run dir but is not on the open
+        # allow-list (output_*, run.log, manifest.json), so it is refused.
+        r = self.client.post(
+            f"/runs/{TS}/open",
+            json={"name": "notes.txt"},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+        self.assertEqual(r.status_code, 403)
+
+    def test_allowed_output_name_passes_allowlist(self) -> None:
+        # output_a.txt is allow-listed; on non-macOS it stops at the platform
+        # guard (400) rather than the allow-list (403). Either way it is NOT a
+        # 403, proving the allow-list let it through.
+        r = self.client.post(
+            f"/runs/{TS}/open",
+            json={"name": "output_a.txt"},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+        self.assertNotEqual(r.status_code, 403)
 
 
 if __name__ == "__main__":  # pragma: no cover

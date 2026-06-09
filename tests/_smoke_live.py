@@ -198,6 +198,26 @@ def main() -> int:
             "finished progress snapshot has no cleartext password",
         )
 
+        # 5d) cancel route: a finished job reports its terminal status; an
+        # unknown job is a 404 (C1). Subject to the CSRF guard (testserver host
+        # is allow-listed, so this passes the guard).
+        r = client.post(
+            f"/api/runs/{job_id}/cancel",
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+        expect(
+            r.status_code == 200 and r.json().get("ok") is True,
+            f"POST /api/runs/{{job_id}}/cancel returns ok (got {r.status_code})",
+        )
+        r = client.post(
+            "/api/runs/does-not-exist/cancel",
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+        expect(
+            r.status_code == 404,
+            f"cancel of an unknown job returns 404 (got {r.status_code})",
+        )
+
         # 6) detail page (reachable once the async run wrote logs/<ts>/)
         r = client.get(f"/runs/{fake_ts}")
         expect(r.status_code == 200, f"GET /runs/{fake_ts} returns 200 (got {r.status_code})")
@@ -325,6 +345,19 @@ def main() -> int:
             any(line.startswith("+") for line in diff_json.get("diff", [])),
             "diff of differing files contains an added line",
         )
+        # Wave 1 additive diff fields (C4): a stats summary and intra-line
+        # word-level segments on replace rows.
+        expect("stats" in diff_json, f"diff JSON has 'stats' (got {list(diff_json)})")
+        expect(
+            set(diff_json.get("stats", {})) == {"added", "removed", "changed", "unchanged"},
+            f"diff stats has the four counters (got {diff_json.get('stats')})",
+        )
+        replace_rows = [r for r in diff_json.get("rows", []) if r.get("tag") == "replace"]
+        expect(bool(replace_rows), "diff has at least one replace row")
+        expect(
+            all("left_segments" in r and "right_segments" in r for r in replace_rows),
+            "replace rows carry intra-line left/right segments",
+        )
 
         # 10e) diffing a file against ITSELF yields identical: true, empty diff
         r = client.get(
@@ -381,6 +414,73 @@ def main() -> int:
             r.status_code == 404,
             f"open with an unknown run returns 404 (got {r.status_code})",
         )
+
+        # 10h) CSRF / DNS-rebinding guard: a non-loopback Host header is 403,
+        #      and a browser-flagged cross-site POST is 403 (A1).
+        r = client.post(
+            f"/runs/{fake_ts}/open",
+            json={"name": "output_10.0.0.1.txt"},
+            headers={"Host": "evil.example", "X-Requested-With": "XMLHttpRequest"},
+        )
+        expect(
+            r.status_code == 403,
+            f"POST with a non-loopback Host is rejected 403 (got {r.status_code})",
+        )
+        r = client.post(
+            f"/runs/{fake_ts}/open",
+            json={"name": "output_10.0.0.1.txt"},
+            headers={"Sec-Fetch-Site": "cross-site", "X-Requested-With": "XMLHttpRequest"},
+        )
+        expect(
+            r.status_code == 403,
+            f"cross-site POST is rejected 403 (got {r.status_code})",
+        )
+
+        # 10i) cross-run endpoints (C2). The fake outputs lack the inner
+        #      timestamp real bulk-show.py embeds, so no common hosts match —
+        #      we just assert the endpoints exist and answer with the right
+        #      shapes / status codes.
+        r = client.get(f"/api/runs/common-hosts?a={fake_ts}&b={fake_ts}")
+        expect(
+            r.status_code == 200 and "hosts" in r.json(),
+            f"GET /api/runs/common-hosts returns hosts list (got {r.status_code})",
+        )
+        r = client.get(
+            f"/api/runs/diff-across?a={fake_ts}&b={fake_ts}&host=10.0.0.1"
+        )
+        expect(
+            r.status_code == 404,
+            f"diff-across 404s when the host has no inner-ts output (got {r.status_code})",
+        )
+
+        # 10j) cross-run compare HTML route (Wave 2). Empty-state renders; a
+        #      valid pair renders the JS host-picker; an unknown run 404s.
+        r = client.get("/runs/compare-across")
+        expect(
+            r.status_code == 200 and "Compare a host across two runs" in r.text,
+            f"GET /runs/compare-across (no params) renders (got {r.status_code})",
+        )
+        r = client.get(f"/runs/compare-across?a={fake_ts}&b={fake_ts}")
+        expect(
+            r.status_code == 200 and 'id="hostpick"' in r.text,
+            f"GET /runs/compare-across with valid runs renders (got {r.status_code})",
+        )
+        r = client.get(f"/runs/compare-across?a=19990101_000000&b={fake_ts}")
+        expect(
+            r.status_code == 404,
+            f"compare-across 404s an unknown run (got {r.status_code})",
+        )
+
+        # 10k) index renders the Wave 2 option fields + progress stepper.
+        r = client.get("/")
+        for marker in (
+            'name="retries"',
+            'name="max_workers"',
+            'name="output_formats"',
+            'name="controller_port"',
+            'id="stepper"',
+        ):
+            expect(marker in r.text, f"index renders {marker}")
 
         # 11) /runs lists the new entry
         r = client.get("/runs")
