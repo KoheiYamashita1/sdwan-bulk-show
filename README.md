@@ -434,6 +434,24 @@ reached on **TCP/22** and lands directly in the viptela CLI:
 2. **Pagination** — the script sends the viptela CLI `paginate false` (instead
    of the IOS-XE `terminal length 0`) before running the show commands.
 
+`vedge` is accepted as a device-type alias and uses this same controller
+profile (viptela CLI, `paginate false`, no `shell` step).
+
+### Pagination and prompt handling
+
+- **Automatic pager disable.** Edges get `terminal length 0` and controllers /
+  vEdge get `paginate false` sent automatically before any commands run.
+- **Interactive pager fallback.** Some contexts have their own pager that the
+  commands above do not cover — most notably IOS-XE `config-transaction`
+  (config) mode, whose `show configuration ...` output stops on `--More--`
+  / `(END)`. `bulk-show.py` detects these prompts and drains them
+  automatically (it tells the pager to dump the rest without pagination), so
+  the full output is captured cleanly with the pager markers and terminal
+  carriage-return redraw noise stripped from the saved logs.
+- **Late-prompt recovery.** If a command's prompt is slow to redraw, the reader
+  nudges the device with a newline and re-checks, so a late prompt is
+  confirmed instead of being misreported as a timeout.
+
 Examples (new options):
 
 ```bash
@@ -461,15 +479,21 @@ python3 bulk-show.py host.txt command.txt --controller-port 22
 Logs are saved under ./logs with timestamps in the file name.
 Use `--logs-dir` to change the destination and `--output-format` to choose formats.
 
-Each session adds explicit boundary markers to the text output (Issue 9), making
-it easy to split logs per host and per command:
+The text output is a continuous terminal transcript: the whole host session
+is wrapped in `session begin` / `session end` markers, but the commands
+themselves run back to back on a single SSH session with no per-command
+markers, exactly as if you had typed them one after another at the prompt. A
+command that never returns to a prompt (e.g. an idle timeout) gets a short
+`!!` note so failures are not hidden.
 
 ```
-=== SESSION BEGIN host=2.1.1.1 port=830 ts=2026-05-02T01:23:45+09:00 ===
---- COMMAND BEGIN cmd="show version" ts=... ---
+===== session begin: 2.1.1.1 user=admin port=830 started=2026-05-02T01:23:45+09:00 =====
+show version
 ... (command output) ...
---- COMMAND END   cmd="show version" status=ok duration=1.23s ts=... ---
-=== SESSION END   host=2.1.1.1 status=success duration=4.56s ts=... ===
+2.1.1.1#show ip interface brief
+... (command output) ...
+2.1.1.1#
+===== session end:   2.1.1.1 status=success ended=... duration=4.56s =====
 ```
 
 With `--output-format json`, an `output_<ip>_<ts>.json` file is generated

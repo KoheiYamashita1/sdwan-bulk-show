@@ -428,6 +428,22 @@ viptela CLI に直接入ります:
 2. **ページング** — show コマンド実行前に、IOS-XE の `terminal length 0` ではなく
    viptela CLI の `paginate false` を送信します。
 
+`vedge` もデバイス種別エイリアスとして使え、このコントローラプロファイル
+（viptela CLI・`paginate false`・`shell` ステップ無し）で扱われます。
+
+### ページングとプロンプトの扱い
+
+- **ページング自動無効化。** エッジには `terminal length 0`、コントローラ / vEdge には
+  `paginate false` を、コマンド実行前に自動投入します。
+- **対話ページャのフォールバック。** 上記で無効化できない独自ページャを持つ場面が
+  あります。代表例が IOS-XE の `config-transaction`（コンフィグ）モードで、
+  `show configuration ...` の出力が `--More--` / `(END)` で停止します。
+  `bulk-show.py` はこれらのプロンプトを検出し、「残りをページングせず一括表示」を
+  指示して自動的に消化するため、全出力をクリーンに取得できます（保存ログからは
+  ページャマーカーや `\r` による再描画ノイズを除去）。
+- **遅延プロンプトの回復。** プロンプトの再描画が遅い場合は、改行を送って再確認する
+  ため、遅れて出るプロンプトをタイムアウト誤判定せずに確定できます。
+
 実行例（新オプション）:
 
 ```bash
@@ -453,14 +469,16 @@ python3 bulk-show.py host.txt command.txt --output-format text,json,csv
 ログは ./logs にタイムスタンプ付きで保存されます。
 `--logs-dir` で保存先を、`--output-format` で形式を指定できます。
 
-各セッションは下記のような境界マーカーをテキスト出力に追加します（議題9）:
+テキスト出力は連続したターミナルのトランスクリプトです。ホストのセッション全体は `session begin` / `session end` マーカーで囲みますが、コマンド自体は 1 本の SSH セッション上で連続的に実行され、コマンドごとの境界マーカーは付きません（プロンプトで手入力したのと同じ流れになります）。プロンプトに戻れなかったコマンド（アイドルタイムアウト等）には短い `!!` 注記を付けて失敗を隠しません。
 
 ```
-=== SESSION BEGIN host=2.1.1.1 port=830 ts=2026-05-02T01:23:45+09:00 ===
---- COMMAND BEGIN cmd="show version" ts=... ---
+===== session begin: 2.1.1.1 user=admin port=830 started=2026-05-02T01:23:45+09:00 =====
+show version
 ... (コマンド出力) ...
---- COMMAND END   cmd="show version" status=ok duration=1.23s ts=... ---
-=== SESSION END   host=2.1.1.1 status=success duration=4.56s ts=... ===
+2.1.1.1#show ip interface brief
+... (コマンド出力) ...
+2.1.1.1#
+===== session end:   2.1.1.1 status=success ended=... duration=4.56s =====
 ```
 
 `--output-format json` を指定すると `output_<ip>_<ts>.json` が生成され、ホスト・ポート・各コマンドの開始終了時刻・ステータス・全出力を含む構造化データが得られます。

@@ -21,6 +21,15 @@ DEFAULT_PROMPT_RE = re.compile(r"(?:^|\n)\S+[#>]\s*\Z")
 # Matches a "Password:" re-authentication prompt at the tail of the buffer.
 PASSWORD_PROMPT_RE = re.compile(r"password:\s*\Z", re.IGNORECASE)
 
+# Interactive pager prompts. IOS-XE SD-WAN "config-transaction" mode (and the
+# confd/viptela CLI generally) uses its own pager that "terminal length 0" /
+# "paginate false" in exec mode does NOT disable, so "show configuration ..."
+# commands stop on a "--More--" prompt (mid-output) or "(END)" (end of output)
+# and wait for a keystroke. read_channel detects these at the tail of the
+# buffer and drains the pager automatically (Space to page, "q" to quit).
+PAGER_MORE_RE = re.compile(r"--\s*More\s*--[^\S\n]*\Z")
+PAGER_END_RE = re.compile(r"\(END\)[^\S\n]*\Z")
+
 # Matches ANSI / VT100 escape sequences: CSI sequences such as "\x1b[?7h"
 # (DEC autowrap), "\x1b[0m" (SGR), and simple two-character escapes. The
 # viptela CLI on vBond / vSmart emits a line-wrap escape ("\x1b[?7h")
@@ -33,6 +42,47 @@ ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 def strip_ansi(text):
     """Remove ANSI / VT100 escape sequences from ``text``."""
     return ANSI_ESCAPE_RE.sub("", text)
+
+
+# Leftover pager markers to scrub from captured command output once the pager
+# has been drained (the interactive Space/q keystrokes are handled elsewhere).
+PAGER_MARKER_RE = re.compile(r"--\s*More\s*--|\(END\)")
+
+
+def _collapse_carriage_returns(text):
+    """Resolve lone carriage-return overwrites within each line.
+
+    Terminals (and the confd/viptela pager) use a bare ``\\r`` to move the
+    cursor back to column 0 and redraw over what is already there. Left in the
+    saved log this shows up as noise; here we normalize ``\\r\\n`` to ``\\n``
+    and then apply each ``\\r`` segment as an overwrite so the retained text
+    matches what the operator would actually see on screen.
+    """
+    text = text.replace("\r\n", "\n")
+    if "\r" not in text:
+        return text
+    out_lines = []
+    for line in text.split("\n"):
+        if "\r" not in line:
+            out_lines.append(line)
+            continue
+        current = ""
+        for segment in line.split("\r"):
+            # Each segment overwrites from column 0; anything longer than the
+            # overwrite is preserved (mirrors real terminal behavior).
+            if len(segment) >= len(current):
+                current = segment
+            else:
+                current = segment + current[len(segment):]
+        out_lines.append(current)
+    return "\n".join(out_lines)
+
+
+def clean_command_output(text):
+    """Scrub pager artifacts and carriage-return noise from command output."""
+    text = PAGER_MARKER_RE.sub("", text)
+    text = _collapse_carriage_returns(text)
+    return text
 
 # Patterns indicating shell-level password authentication failure.
 # Matched case-insensitively against the buffer received after sending
@@ -115,6 +165,10 @@ DEVICE_TYPE_ALIASES = {
     "vsmart": DEVICE_CONTROLLER,
     "vbond": DEVICE_CONTROLLER,
     "vmanage": DEVICE_CONTROLLER,
+    # vEdge hardware / cloud run the viptela CLI (same as vBond/vSmart): a
+    # single SSH password, no "shell" sub-process, and pagination disabled
+    # with "paginate false". So it uses the controller connection profile.
+    "vedge": DEVICE_CONTROLLER,
 }
 
 
@@ -263,10 +317,6 @@ SESSION_BEGIN_FMT = (
 SESSION_END_FMT = (
     "===== session end:   {host} status={status} ended={ts} duration={dur:.2f}s ====="
 )
-COMMAND_BEGIN_FMT = "===== begin: {cmd} @ {ts} ====="
-COMMAND_END_FMT = (
-    "===== end:   {cmd} status={status} duration={dur:.2f}s exit={kind} ====="
-)
 
 
 def now_iso():
@@ -294,6 +344,8 @@ def read_channel(
     idle_timeout=1.0,
     max_wait=60.0,
     poll_interval=0.1,
+    handle_pager=True,
+    max_pager_advances=10000,
 ):
     """
     Read from the SSH channel until prompt_re or expect_re matches the tail
@@ -311,6 +363,12 @@ def read_channel(
         max_wait: hard upper bound for the entire read.
         poll_interval: short channel.recv timeout. Keeps idle accounting
                        precise without busy-spinning.
+        handle_pager: when True, transparently drain an interactive pager by
+                      sending Space at a ``--More--`` prompt and ``q`` at an
+                      ``(END)`` prompt. This is needed for config-mode "show"
+                      commands whose pager ignores "terminal length 0".
+        max_pager_advances: safety cap on the number of pager keystrokes sent
+                      during a single read (guards against a stuck pager).
 
     Returns:
         Tuple (buffer, match_kind). match_kind is one of:
@@ -320,6 +378,11 @@ def read_channel(
     chunks = []
     start = time.monotonic()
     last_data = start
+    pager_advances = 0
+    # Byte length of the buffer at the last pager keystroke. Guards against
+    # sending a second keystroke for the same pager prompt before the device
+    # has responded with the next page.
+    len_at_last_pager = -1
     while True:
         now = time.monotonic()
         if now - start >= max_wait:
@@ -342,16 +405,98 @@ def read_channel(
         # idle exits still get a final chance to confirm the tail. Strip ANSI
         # escapes first so embedded sequences (e.g. the viptela "\x1b[?7h"
         # emitted before the prompt) do not defeat the prompt/expect regexes.
-        tail = strip_ansi("".join(chunks))[-1024:]
+        joined = "".join(chunks)
+        tail = strip_ansi(joined)[-1024:]
         if expect_re is not None and expect_re.search(tail):
-            return strip_ansi("".join(chunks)), MATCH_EXPECT
-        if prompt_re is not None and prompt_re.search(tail):
-            return strip_ansi("".join(chunks)), MATCH_PROMPT
+            return strip_ansi(joined), MATCH_EXPECT
+
+        # Drain an interactive pager before considering prompt/idle exits.
+        # Only send one keystroke per distinct pager prompt (i.e. once the
+        # buffer has grown since the previous keystroke) so we advance page by
+        # page instead of spamming keys.
+        if handle_pager and len(joined) != len_at_last_pager:
+            pager_key = None
+            if PAGER_MORE_RE.search(tail):
+                # "!" tells the confd/viptela pager to dump the remaining text
+                # without further pagination, so we settle straight on the CLI
+                # prompt instead of stopping again at "(END)" (which redraws
+                # itself and echoes stray quit keys into the next command).
+                pager_key = "!"
+            elif PAGER_END_RE.search(tail):
+                pager_key = "q"
+            if pager_key is not None:
+                if pager_advances >= max_pager_advances:
+                    return strip_ansi(joined), MATCH_MAX_WAIT
+                try:
+                    channel.send(pager_key)
+                except OSError:
+                    return strip_ansi(joined), MATCH_EOF
+                pager_advances += 1
+                len_at_last_pager = len(joined)
+                last_data = now
+                continue
+
+        # Prompt detection runs on a tail with pager markers and carriage
+        # returns normalized away, so a prompt that the pager drew right after
+        # "(END)" or behind a bare "\r" (no newline) is still recognized.
+        prompt_tail = PAGER_MARKER_RE.sub("", tail).replace("\r", "\n")
+        if prompt_re is not None and prompt_re.search(prompt_tail):
+            return strip_ansi(joined), MATCH_PROMPT
 
         # Idle exit: at least some data has been received and nothing new
         # has arrived for idle_timeout seconds.
         if chunks and now - last_data >= idle_timeout:
-            return strip_ansi("".join(chunks)), MATCH_IDLE
+            return strip_ansi(joined), MATCH_IDLE
+
+
+def read_until_prompt(
+    channel,
+    prompt_re,
+    idle_timeout=1.0,
+    max_wait=120.0,
+    nudge_attempts=2,
+    nudge_wait=5.0,
+):
+    """Read command output and robustly confirm the trailing device prompt.
+
+    ``read_channel`` returns as soon as the output goes idle. Some CLIs pause
+    for longer than ``idle_timeout`` between the last line of output and
+    re-drawing the prompt (e.g. IOS-XE ``show sdwan control connections``),
+    which used to be misreported as a timeout while the prompt was actually
+    just late and got swallowed by the next command's capture.
+
+    This wrapper strengthens prompt detection: when the initial read exits on
+    ``MATCH_IDLE`` / ``MATCH_MAX_WAIT`` without matching ``prompt_re``, it sends
+    a single newline to nudge the device into re-emitting its prompt and reads
+    again, up to ``nudge_attempts`` times. The nudge output (a blank line plus
+    the prompt) is appended so the transcript still ends on a clean prompt.
+
+    Returns ``(buffer, match_kind)`` where ``match_kind`` is the final result
+    (``MATCH_PROMPT`` once the prompt is confirmed).
+    """
+    buf, kind = read_channel(
+        channel,
+        prompt_re=prompt_re,
+        idle_timeout=idle_timeout,
+        max_wait=max_wait,
+    )
+    attempts = 0
+    while kind in (MATCH_IDLE, MATCH_MAX_WAIT) and attempts < nudge_attempts:
+        attempts += 1
+        try:
+            channel.send("\n")
+        except OSError:
+            break
+        extra, kind = read_channel(
+            channel,
+            prompt_re=prompt_re,
+            idle_timeout=idle_timeout,
+            max_wait=nudge_wait,
+        )
+        buf += extra
+        if kind == MATCH_PROMPT:
+            break
+    return buf, kind
 
 
 def extract_prompt(buffer):
@@ -412,7 +557,19 @@ def _write_outputs(session_result, output_paths):
 
 
 def _write_text(session_result, path):
-    """Write a per-host text log with session/command boundary markers."""
+    """Write a per-host text log as a continuous terminal transcript.
+
+    The whole host session is wrapped in session begin/end markers (the web
+    UI parses ``session end`` to roll up per-host status), but individual
+    commands are NOT wrapped: each command's captured output — including the
+    echoed command line and the trailing device prompt — is written back to
+    back so the file reads like one uninterrupted interactive session, exactly
+    as if the commands had been typed one after another at the prompt.
+
+    A command that never settled on a prompt (e.g. an idle/timeout) still
+    gets a short ``!!`` note on its own line so failures are not hidden; the
+    richer per-command metadata remains available in the JSON/CSV outputs.
+    """
     with open(path, "w") as f:
         f.write(
             SESSION_BEGIN_FMT.format(
@@ -427,26 +584,26 @@ def _write_text(session_result, path):
         # text reader does not have to guess why the file is otherwise empty.
         if session_result.get("error"):
             f.write(f"!! {session_result['error']}\n")
+        # Concatenate command outputs verbatim. Because each command's capture
+        # ends on the device prompt and the next capture starts with that
+        # command's echo, the natural "prompt#next-command" flow is preserved.
+        pending_newline = False
         for cmd in session_result["commands"]:
-            f.write(
-                COMMAND_BEGIN_FMT.format(
-                    cmd=cmd["command"],
-                    ts=cmd["started_at"],
+            output = cmd["output"]
+            f.write(output)
+            pending_newline = bool(output) and not output.endswith("\n")
+            if cmd["status"] != CMD_OK:
+                # Ensure the note lands on its own line, then continue the
+                # transcript on a fresh line for the following command.
+                if pending_newline:
+                    f.write("\n")
+                f.write(
+                    f"!! command did not return a prompt: {cmd['command']} "
+                    f"(exit={cmd['exit_kind']}, {cmd['duration_s']:.2f}s)\n"
                 )
-                + "\n"
-            )
-            f.write(cmd["output"])
-            if not cmd["output"].endswith("\n"):
-                f.write("\n")
-            f.write(
-                COMMAND_END_FMT.format(
-                    cmd=cmd["command"],
-                    status=cmd["status"],
-                    dur=cmd["duration_s"],
-                    kind=cmd["exit_kind"],
-                )
-                + "\n"
-            )
+                pending_newline = False
+        if pending_newline:
+            f.write("\n")
         f.write(
             SESSION_END_FMT.format(
                 host=session_result["host"],
@@ -692,9 +849,10 @@ def connect_and_execute(
                     f"[{router_ip}] prompt: <not captured, using default regex>"
                 )
 
-            # Phase 4: Disable pagination in the viptela CLI.
+            # Phase 4: Disable pagination in the viptela CLI (vBond / vSmart /
+            # vEdge). Sent automatically for every controller-profile host.
             shell.send("paginate false\n")
-            _, page_kind = read_channel(
+            _, page_kind = read_until_prompt(
                 shell,
                 prompt_re=cmd_prompt_re,
                 idle_timeout=1.0,
@@ -769,10 +927,12 @@ def connect_and_execute(
                     f"[{router_ip}] prompt: <not captured, using default regex>"
                 )
 
-            # Phase 4: Disable pagination. Wait for the captured prompt to
-            # ensure the shell is settled before user commands start.
+            # Phase 4: Disable pagination on the IOS-XE edge with
+            # 'terminal length 0' (sent automatically for every edge-profile
+            # host). Wait for the captured prompt to ensure the shell is
+            # settled before user commands start.
             shell.send("terminal length 0\n")
-            _, term_kind = read_channel(
+            _, term_kind = read_until_prompt(
                 shell,
                 prompt_re=cmd_prompt_re,
                 idle_timeout=1.0,
@@ -805,16 +965,23 @@ def connect_and_execute(
                 log_message(f"[{router_ip}] running: {command}")
                 cmd_started_wall = now_iso()
                 cmd_started_mono = time.monotonic()
-                shell.send(f"{command}\n")
+                # Prefix Ctrl-U (line kill) so any keystroke the previous
+                # command's pager left echoed on the input line (e.g. "!" or
+                # "q") is cleared before this command is typed; otherwise it
+                # would prepend to and corrupt the command.
+                shell.send(f"\x15{command}\n")
                 # Prompt detection short-circuits short commands; max_wait
                 # is the safety upper bound for long commands like
-                # 'show tech-support'.
-                command_output, cmd_kind = read_channel(
+                # 'show tech-support'. read_until_prompt nudges the device
+                # with a newline if the prompt is slow to redraw, so a late
+                # prompt is confirmed instead of being misreported as idle.
+                command_output, cmd_kind = read_until_prompt(
                     shell,
                     prompt_re=cmd_prompt_re,
                     idle_timeout=1.0,
                     max_wait=120.0,
                 )
+                command_output = clean_command_output(command_output)
                 cmd_status = CMD_OK if cmd_kind == MATCH_PROMPT else CMD_TIMEOUT
                 session_result["commands"].append(
                     {

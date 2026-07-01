@@ -34,7 +34,9 @@ class NormalizeDeviceTypeTests(unittest.TestCase):
     def test_known_aliases_map_to_canonical(self) -> None:
         self.assertEqual(bulk_show.normalize_device_type("edge"), bulk_show.DEVICE_EDGE)
         self.assertEqual(bulk_show.normalize_device_type("cedge"), bulk_show.DEVICE_EDGE)
-        for alias in ("controller", "ctrl", "vsmart", "vbond", "vmanage"):
+        # vEdge runs the viptela CLI, so it uses the controller profile
+        # (paginate false, no shell step).
+        for alias in ("controller", "ctrl", "vsmart", "vbond", "vmanage", "vedge"):
             self.assertEqual(
                 bulk_show.normalize_device_type(alias),
                 bulk_show.DEVICE_CONTROLLER,
@@ -171,6 +173,66 @@ class ReadChannelControllerTests(unittest.TestCase):
         )
         self.assertEqual(kind, bulk_show.MATCH_PROMPT)
         self.assertEqual(buf, "vsmart# ")
+
+
+class ReadUntilPromptTests(unittest.TestCase):
+    def test_late_prompt_recovered_by_nudge(self) -> None:
+        # First read yields output that goes idle without a prompt; after the
+        # newline nudge the device redraws its prompt and completion is
+        # confirmed (MATCH_PROMPT), not misreported as a timeout.
+        cmd_re = bulk_show.build_command_prompt_re("RT01#")
+        chan = FakeChannel([b"show sdwan control connections\n<table>\n", b"RT01#"])
+        buf, kind = bulk_show.read_until_prompt(
+            chan, prompt_re=cmd_re, idle_timeout=0.05, max_wait=1.0, nudge_wait=1.0
+        )
+        self.assertEqual(kind, bulk_show.MATCH_PROMPT)
+        self.assertTrue(buf.rstrip().endswith("RT01#"))
+
+    def test_gives_up_after_bounded_nudges(self) -> None:
+        # A device that never returns a prompt must not spin forever: the
+        # nudges are bounded and a non-prompt result is returned.
+        cmd_re = bulk_show.build_command_prompt_re("RT01#")
+        chan = FakeChannel([b"partial output with no prompt\n"])
+        buf, kind = bulk_show.read_until_prompt(
+            chan,
+            prompt_re=cmd_re,
+            idle_timeout=0.05,
+            max_wait=0.3,
+            nudge_attempts=2,
+            nudge_wait=0.2,
+        )
+        self.assertIn(kind, (bulk_show.MATCH_IDLE, bulk_show.MATCH_MAX_WAIT))
+        self.assertIn("partial output", buf)
+
+
+class PagerHandlingTests(unittest.TestCase):
+    def test_drains_more_and_end_prompts(self) -> None:
+        # Simulate a config-mode pager: a "--More--" mid-output prompt, then an
+        # "(END)" prompt, then the real config prompt. read_channel must page
+        # through both and settle on MATCH_PROMPT with all content captured.
+        cmd_re = bulk_show.build_command_prompt_re("RT01#")
+        chan = FakeChannel(
+            [
+                b"header line\n--More--",
+                b"\r        \rmiddle line\n(END)",
+                b"\rRT01(config)# ",
+            ]
+        )
+        buf, kind = bulk_show.read_channel(
+            chan, prompt_re=cmd_re, idle_timeout=0.05, max_wait=2.0, poll_interval=0.01
+        )
+        self.assertEqual(kind, bulk_show.MATCH_PROMPT)
+        self.assertIn("header line", buf)
+        self.assertIn("middle line", buf)
+
+    def test_clean_command_output_scrubs_pager_noise(self) -> None:
+        raw = "row1\n--More--\r        \rrow2\n(END)\rRT01(config)# "
+        cleaned = bulk_show.clean_command_output(raw)
+        self.assertNotIn("--More--", cleaned)
+        self.assertNotIn("(END)", cleaned)
+        self.assertNotIn("\r", cleaned)
+        self.assertIn("row1", cleaned)
+        self.assertIn("row2", cleaned)
 
 
 class ParseHostLineTests(unittest.TestCase):
