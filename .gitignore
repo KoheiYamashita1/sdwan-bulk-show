@@ -10,6 +10,9 @@ settings.*.local.json
 __pycache__/
 *.pyc
 
+# CI workflow kept local only (push token lacks the GitHub "workflow" scope)
+.github/workflows/ci.yml
+
 # transient artefacts from local tooling
 .playwright-mcp/
 webui-index.png
