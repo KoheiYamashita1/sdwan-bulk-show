@@ -96,6 +96,10 @@ A small FastAPI + Uvicorn app under [`webapp/`](webapp/) wraps
 The UI is intended for **single-user, local use on the operator's machine** —
 the server binds to `127.0.0.1` only and there is no built-in authentication.
 
+> **See it in action:** [Web UI walkthrough (screenshots)](docs/walkthrough.md)
+> — a screen-by-screen tour of a full run (form → progress → results → past
+> runs → diff).
+
 ## Launching the web UI
 
 ```bash
@@ -196,6 +200,10 @@ Behind the scenes the runner ([`webapp/runner.py`](webapp/runner.py)):
   notes how many bytes were dropped.
 
 ## UI overview (ASCII wireframes)
+
+> For actual screenshots of every screen, see the
+> [Web UI walkthrough](docs/walkthrough.md). The ASCII sketches below are a
+> quick text-only reference.
 
 `GET /` — run form:
 
